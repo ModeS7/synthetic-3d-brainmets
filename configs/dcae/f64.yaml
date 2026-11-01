@@ -1,0 +1,9 @@
+# DC-AE f64c128: 256×256 → 4×4×128 (64× spatial compression)
+defaults:
+  - default
+
+latent_channels: 128
+compression_ratio: 64
+# Scaling factor derived from ImageNet pretrained weights
+# Computed as 1/std of latent activations on calibration set
+scaling_factor: 0.2889

@@ -1,0 +1,47 @@
+# Shared 3D Volume Configuration
+#
+# Default volume dimensions for 3D training (VAE-3D, VQ-VAE-3D).
+# Used by: vae_3d.yaml, vqvae_3d.yaml
+
+# Input dimensions (after padding)
+depth: 160                        # Pad 150 -> 160 for clean 8x compression
+height: 256
+width: 256
+
+# Training resolution (optional - defaults to height/width if not set)
+# Allows training at lower resolution for speed, while validating at full resolution.
+# Fully convolutional models generalize across resolutions.
+train_height: null                # null = use height (256)
+train_width: null                 # null = use width (256)
+
+# Test resolution (optional - defaults to height/width if not set)
+# Allows running test evaluation at full resolution after training at lower resolution.
+# Training resources are freed before test to fit full-res volumes in GPU memory.
+test_height: null                 # null = use height
+test_width: null                  # null = use width
+
+# Padding
+pad_depth_to: 160                 # Target depth after padding
+pad_mode: replicate               # replicate or constant (zeros)
+
+# Original depth (for metrics - excludes padded slices from feature extraction)
+original_depth: 150               # Original depth before padding
+
+# Training data splits
+# Default: [train] uses only the train/ directory.
+# Set to [train, val, test_new] to train on all 156 volumes.
+train_splits: null                # null = ["train"] (default). List of split names to merge.
+
+# Slice subsampling (for quick testing)
+slice_step: 1                     # 1=all slices, 2=every 2nd, 3=every 3rd
+
+# Intensity normalization
+normalization:
+  method: per_volume              # per_volume (default) | global_percentile
+  # Per-modality clip_max (brain-only p99.5 of raw intensities)
+  # Required for global_percentile. Ignored for per_volume.
+  clip_max:
+    bravo: 5898
+    t1_pre: 1257
+    t1_gd: 1353
+    flair: 1800

@@ -1,0 +1,270 @@
+"""Training entry point for nnU-Net v2 with TensorBoard logging.
+
+Uses argparse (NOT Hydra) — nnU-Net has its own config system.
+
+Workflow per experiment:
+    1. Set nnU-Net env vars (per-experiment isolated preprocessed + results)
+    2. Create isolated preprocessed dir with experiment-specific splits
+    3. Register custom TensorBoard trainer
+    4. Run nnU-Net training for specified fold(s)
+
+Usage:
+    # Train baseline (real-only), all 5 folds
+    python -m medgen.scripts.train_nnunet \
+        --experiment baseline \
+        --nnunet-base /cluster/work/${USER}/nnunet
+
+    # Train mixed with 210 synthetic, fold 0 only
+    python -m medgen.scripts.train_nnunet \
+        --experiment mixed --n-synthetic 210 \
+        --fold 0 \
+        --nnunet-base /cluster/work/${USER}/nnunet
+
+    # Continue interrupted training
+    python -m medgen.scripts.train_nnunet \
+        --experiment baseline --fold 0 \
+        --nnunet-base /cluster/work/${USER}/nnunet \
+        --continue-training
+"""
+import argparse
+import os
+import random
+import shutil
+
+import numpy as np
+import torch
+
+
+def _set_training_seed(seed: int) -> None:
+    """Seed parent-process RNGs before nnU-Net constructs the network.
+
+    This pairs model initialization and parent-process randomness across
+    experiments. nnU-Net's default multi-process augmentation remains
+    asynchronous, so this is not a claim of bitwise deterministic training.
+    """
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _setup_env(
+    nnunet_base: str,
+    nnunet_results: str,
+    experiment_name: str,
+    isolated_preprocessed: str | None = None,
+) -> None:
+    """Set nnU-Net environment variables.
+
+    Raw data is under nnunet_base. Preprocessed points to the isolated
+    per-experiment dir (if provided) to avoid split race conditions.
+    Results are under nnunet_results (per-experiment).
+    """
+    os.environ['nnUNet_raw'] = os.path.join(nnunet_base, 'nnUNet_raw')  # noqa: SIM112
+    if isolated_preprocessed is not None:
+        os.environ['nnUNet_preprocessed'] = isolated_preprocessed  # noqa: SIM112
+    else:
+        os.environ['nnUNet_preprocessed'] = os.path.join(nnunet_base, 'nnUNet_preprocessed')  # noqa: SIM112
+    os.environ['nnUNet_results'] = os.path.join(  # noqa: SIM112
+        nnunet_results, experiment_name,
+    )
+
+    for key in ('nnUNet_raw', 'nnUNet_preprocessed', 'nnUNet_results'):
+        os.makedirs(os.environ[key], exist_ok=True)
+        print(f"  {key}={os.environ[key]}")
+
+
+def _register_trainer() -> None:
+    """Register custom TensorBoard trainer into nnunetv2 package.
+
+    Symlinks our trainer.py into nnunetv2/training/nnUNetTrainer/ so that
+    nnU-Net's class discovery finds it. A shared file lock makes first-time
+    registration safe when all five SLURM array tasks start together. Falls
+    back to copy if symlink creation is unavailable.
+    """
+    import fcntl
+
+    import nnunetv2.training.nnUNetTrainer as trainer_pkg
+
+    trainer_dir = os.path.dirname(trainer_pkg.__file__)
+    our_trainer = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        'downstream', 'nnunet', 'trainer.py',
+    )
+    target = os.path.join(trainer_dir, 'nnUNetTrainerTensorBoard.py')
+    lock_path = f'{target}.lock'
+
+    with open(lock_path, 'a') as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+
+        if os.path.lexists(target):
+            if (
+                os.path.islink(target)
+                and os.path.realpath(target) == os.path.realpath(our_trainer)
+            ):
+                print(f"  Trainer already registered: {target}")
+                return
+            os.remove(target)
+
+        try:
+            os.symlink(our_trainer, target)
+            print(f"  Symlinked trainer: {target} -> {our_trainer}")
+        except OSError:
+            shutil.copy2(our_trainer, target)
+            print(f"  Copied trainer to: {target}")
+
+
+def _get_experiment_name(experiment: str, n_synthetic: int | None) -> str:
+    """Build a unique experiment name for results directory."""
+    if experiment == 'baseline':
+        return 'exp3_baseline'
+    elif experiment == 'baseline_dual':
+        return 'exp4_baseline_dual'
+    elif experiment == 'synthetic':
+        if n_synthetic is not None:
+            return f'exp6_synthetic_{n_synthetic}'
+        return 'exp6_synthetic'
+    elif experiment == 'mixed':
+        n = n_synthetic if n_synthetic is not None else 525
+        return f'exp7_mixed_{n}syn'
+    return experiment
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description='Train nnU-Net with TensorBoard logging',
+    )
+    parser.add_argument('--experiment', required=True,
+                        choices=['baseline', 'baseline_dual', 'synthetic', 'mixed'],
+                        help='Experiment type')
+    parser.add_argument('--experiment-name', default=None,
+                        help='Override auto-generated experiment name (results subdir)')
+    parser.add_argument('--n-synthetic', type=int, default=None,
+                        help='Number of synthetic samples for mixed (default: all 525)')
+    parser.add_argument('--synthetic-manifest', default=None,
+                        help='Ordered complete synthetic-case manifest; selects prefixes')
+    parser.add_argument('--dataset-id', type=int, default=501,
+                        help='Dataset ID (default: 501)')
+    parser.add_argument('--configuration', default='3d_fullres',
+                        choices=['2d', '3d_fullres', '3d_lowres', '3d_cascade_fullres'])
+    parser.add_argument('--fold', type=int, default=None,
+                        help='Fold number 0-4 (default: all 5 folds)')
+    parser.add_argument('--nnunet-base', required=True,
+                        help='Base directory for nnU-Net data (raw + preprocessed)')
+    parser.add_argument('--nnunet-results', required=True,
+                        help='Base directory for nnU-Net results/checkpoints')
+    parser.add_argument('--trainer', default='nnUNetTrainerTensorBoard',
+                        help='Trainer class name')
+    parser.add_argument('--plans', default='nnUNetPlans',
+                        help='Plans identifier')
+    parser.add_argument('--continue-training', action='store_true',
+                        help='Continue from last checkpoint')
+    parser.add_argument('--validation-only', action='store_true',
+                        help='Skip training; only re-run validation on the already-trained '
+                             'checkpoint(s) for the requested fold(s). Useful to recompute '
+                             'val metrics or to export val softmax probabilities for '
+                             'post-hoc threshold tuning.')
+    parser.add_argument('--export-validation-probabilities', action='store_true',
+                        help='When validating (during training or with --validation-only), '
+                             'export per-case softmax probabilities (.npz) to each fold\'s '
+                             'validation/ subdirectory. Required for the rigorous '
+                             'val-tuned threshold sweep.')
+    parser.add_argument('--device', default='cuda',
+                        choices=['cuda', 'cpu', 'mps'])
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Training RNG seed. Applied before model construction; '
+                             'use matched seeds for paired experiments.')
+
+    args = parser.parse_args()
+
+    experiment_name = args.experiment_name or _get_experiment_name(args.experiment, args.n_synthetic)
+    folds = [args.fold] if args.fold is not None else list(range(5))
+
+    print("=== nnU-Net Training Setup ===")
+    print(f"  Experiment: {experiment_name}")
+    print(f"  Folds: {folds}")
+    print(f"  Training seed: {args.seed if args.seed is not None else 'unseeded'}")
+
+    # 1. Set raw + results env vars (preprocessed set after isolation)
+    print("\nEnvironment:")
+    shared_preprocessed = os.path.join(args.nnunet_base, 'nnUNet_preprocessed')
+
+    # 2. Create isolated preprocessed dir with experiment-specific splits
+    # This prevents race conditions when multiple experiments run concurrently.
+    print("\nCreating isolated preprocessed dir:")
+    from medgen.downstream.nnunet.splits import (
+        _load_case_info,
+        _load_synthetic_manifest,
+        create_isolated_preprocessed_dir,
+        generate_experiment_splits,
+    )
+
+    # Need raw env var set to load case info
+    os.environ['nnUNet_raw'] = os.path.join(args.nnunet_base, 'nnUNet_raw')  # noqa: SIM112
+    case_info = _load_case_info(os.environ['nnUNet_raw'], args.dataset_id)  # noqa: SIM112
+    synthetic_order = None
+    if args.synthetic_manifest is not None:
+        synthetic_order = _load_synthetic_manifest(
+            args.synthetic_manifest,
+            case_info['synthetic_cases'],
+        )
+        print(
+            f"  Synthetic manifest: {args.synthetic_manifest} "
+            f"({len(synthetic_order)} ordered cases)"
+        )
+    splits = generate_experiment_splits(
+        experiment=args.experiment,
+        real_train_cases=case_info['real_train_cases'],
+        synthetic_cases=case_info['synthetic_cases'],
+        n_synthetic=args.n_synthetic,
+        synthetic_order=synthetic_order,
+    )
+    isolated_preprocessed = create_isolated_preprocessed_dir(
+        experiment_name=experiment_name,
+        splits=splits,
+        nnunet_preprocessed=shared_preprocessed,
+        dataset_id=args.dataset_id,
+    )
+
+    # Now set all env vars with the isolated preprocessed path
+    _setup_env(args.nnunet_base, args.nnunet_results, experiment_name,
+               isolated_preprocessed=isolated_preprocessed)
+
+    # 3. Register custom trainer
+    print("\nRegistering trainer:")
+    _register_trainer()
+
+    # 4. Run training for each fold
+    from nnunetv2.run.run_training import run_training
+
+    for fold in folds:
+        if args.seed is not None:
+            _set_training_seed(args.seed)
+        print(f"\n{'='*50}")
+        print(f"=== Training fold {fold} ===")
+        print(f"  Train: {len(splits[fold]['train'])} cases")
+        print(f"  Val:   {len(splits[fold]['val'])} cases")
+        print(f"{'='*50}\n")
+
+        run_training(
+            dataset_name_or_id=str(args.dataset_id),
+            configuration=args.configuration,
+            fold=fold,
+            trainer_class_name=args.trainer,
+            plans_identifier=args.plans,
+            num_gpus=1,
+            pretrained_weights=None,
+            export_validation_probabilities=args.export_validation_probabilities,
+            continue_training=args.continue_training,
+            only_run_validation=args.validation_only,
+            disable_checkpointing=False,
+            device=torch.device(args.device),
+        )
+
+    print(f"\n=== Training complete: {experiment_name} ===")
+
+
+if __name__ == '__main__':
+    main()

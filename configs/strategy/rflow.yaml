@@ -1,0 +1,48 @@
+# Rectified Flow Strategy
+#
+# Flow-based diffusion that learns straight paths from noise to data.
+# Predicts velocity (direction of change) instead of noise.
+# Often achieves same quality with fewer sampling steps.
+#
+# Reference: https://arxiv.org/abs/2209.03003
+#
+# Training:
+#   1. Interpolate: x_t = (1-t) * x_0 + t * noise
+#   2. Model predicts velocity: v_pred = model(x_t, t)
+#   3. Target velocity: v_target = x_0 - noise (data minus noise)
+#   4. Loss: MSE(v_pred, v_target)
+#
+# Inference:
+#   1. Start with pure noise x_T
+#   2. Follow velocity field: x_{t-dt} = x_t - v_pred * dt
+#   3. Returns clean image x_0
+#
+# Key difference from DDPM:
+#   - Learns straighter paths -> can use fewer steps
+#   - Logit-normal timestep sampling biases toward middle timesteps
+
+name: rflow
+num_train_timesteps: 1000         # Total flow steps
+use_discrete_timesteps: false     # Use continuous timesteps (true for RFlow)
+sample_method: logit-normal       # Bias sampling to mid-range t
+use_timestep_transform: true      # Apply timestep transformation
+prediction_type: velocity         # Predict velocity (vs noise for ddpm)
+
+# ODE solver for generation (requires torchdiffeq for non-euler solvers)
+# Fixed-step: euler (default, no extra dependency), midpoint, heun2, heun3, rk4
+# Adaptive:   fehlberg2, bosh3, dopri5, dopri8
+ode_solver: euler
+ode_atol: 1e-5                    # Absolute tolerance (dopri5 only)
+ode_rtol: 1e-5                    # Relative tolerance (dopri5 only)
+
+# Loss weighting and preconditioning (exp1e / exp1f)
+snr_gamma: 0.0                    # Min-SNR-γ for RFlow. 0 = disabled, 5.0 = standard
+sigma_data: 0.0                   # EDM preconditioning. 0 = disabled, 0.08 = bravo [0,1]
+
+# Loss shape (exp1g / exp1h)
+# perceptual_huber = (1-t)-Huber + a perceptual term; the perceptual half needs
+#   training.perceptual_weight>0 (else it's silently Huber-only — the exp48c/exp47c bug;
+#   now a hard error). Backbone = perceptual_network_type (default RadImageNet, NOT true LPIPS).
+# weighted_huber = the (1-t)-Huber alone (honest name for the exp48c/exp47c as-ran recipe).
+# lpips_huber = DEPRECATED alias of perceptual_huber (kept for old configs).
+loss_type: mse                    # mse (default), pseudo_huber, perceptual_huber (alias: lpips_huber), weighted_huber, l1

@@ -1,0 +1,119 @@
+# DC-AE default architecture configuration
+# Shared by all compression variants (f32, f64)
+#
+# Based on MIT HAN Lab's Deep Compression Autoencoder
+# Paper: https://arxiv.org/abs/2410.10733
+
+# Input/output channels
+in_channels: 1  # Grayscale MRI
+image_size: 256  # Input image size
+
+# Pretrained model (null = train from scratch)
+# Options:
+#   - null: Random initialization
+#   - "mit-han-lab/dc-ae-f32c32-in-1.0-diffusers": ImageNet f32
+#   - "mit-han-lab/dc-ae-f64c128-in-1.0-diffusers": ImageNet f64
+pretrained: null
+
+# Loss weights
+# Phase 1: L1 + Perceptual (no GAN)
+# Phase 3: L1 + Perceptual + GAN (adv_weight > 0)
+l1_weight: 1.0
+# DC-AE uses 100x higher perceptual weight (0.1 vs VAE's 0.001) because:
+# 1. DC-AE is deterministic (no KL regularization) - needs stronger perceptual guidance
+# 2. Higher compression (32x or 64x) loses more detail - perceptual loss compensates
+# 3. Empirically tuned for stable GAN training at high compression ratios
+perceptual_weight: 0.1
+# Perceptual loss type:
+#   - "radimagenet": MONAI's RadImageNet ResNet50 (default, medical imaging features)
+#   - "lpips": LPIPS library with VGG backbone (Zhang 2018, human perceptual calibration)
+# DC-AE paper uses LPIPS for training. RadImageNet may be better for medical data.
+perceptual_loss_type: radimagenet
+# GAN loss weight - set >0 for Phase 3 training
+# Paper uses 0.1 for Phase 3 local refinement
+adv_weight: 0.0
+# Discriminator learning rate
+# Phase 1: 5e-4 (default, but GAN disabled)
+# Phase 3: 5.4e-5 (paper recommendation)
+disc_lr: 5.0e-4
+
+# Phase 3 training notes:
+# - Freezes ALL layers EXCEPT decoder head (norm_out, conv_out)
+# - Only ~1.4K trainable params (vs ~323M total) - very targeted refinement
+# - Paper: "we only tune the head layers of the decoder"
+# - CRITICAL: Must use different optimizer betas for GAN stability
+# - Recommended overrides for Phase 3:
+#   training.learning_rate: 5.4e-5
+#   training.optimizer.betas: [0.5, 0.9]  # REQUIRED - default [0.9,0.999] causes metric degradation
+#   dcae.adv_weight: 0.1
+
+# ============================================================================
+# Segmentation Mode (for mask compression)
+# ============================================================================
+# When seg_mode=true:
+# - Uses BCE + Dice + Boundary loss instead of L1 + Perceptual
+# - Validation uses Dice/IoU instead of PSNR/LPIPS/MS-SSIM
+# - Model outputs logits, sigmoid applied at inference
+#
+# Usage:
+#   python -m medgen.scripts.train_dcae dcae.seg_mode=true mode=seg_compression
+seg_mode: false
+
+# Segmentation loss weights (only used when seg_mode=true)
+seg_loss_weights:
+  bce: 1.0       # Binary cross-entropy (numerically stable)
+  dice: 1.0      # Dice loss (handles class imbalance)
+  boundary: 0.5  # Boundary-weighted BCE (important for small tumors)
+
+# Architecture (shared across f32/f64)
+encoder_block_out_channels: [128, 256, 512, 512, 1024, 1024]
+decoder_block_out_channels: [128, 256, 512, 512, 1024, 1024]
+encoder_layers_per_block: [2, 2, 2, 3, 3, 3]
+decoder_layers_per_block: [3, 3, 3, 3, 3, 3]
+encoder_qkv_multiscales: [[], [], [], [5], [5], [5]]
+decoder_qkv_multiscales: [[], [], [], [5], [5], [5]]
+encoder_block_types: ResBlock
+decoder_block_types: ResBlock
+downsample_block_type: pixel_unshuffle
+upsample_block_type: pixel_shuffle
+encoder_out_shortcut: true
+decoder_in_shortcut: true
+
+# Compression-specific (override in f32.yaml / f64.yaml)
+latent_channels: 32
+compression_ratio: 32
+scaling_factor: 0.3189
+
+# ============================================================================
+# DC-AE 1.5: Structured Latent Space (DC-Gen)
+# ============================================================================
+# Paper: "DC-Gen: Diffusion Convergence Acceleration with Structured Latent Space"
+# https://arxiv.org/abs/2412.09612
+#
+# Key idea: Train autoencoder with adaptive convolution weight slicing so that:
+# - Front channels capture object structure/semantics
+# - Later channels capture image details
+#
+# Implementation (official DC-Gen approach):
+# 1. Sample random channel count c' from [min_channels, min+step, ..., latent_channels]
+# 2. Encoder output conv: slice weights[:c'] to compute ONLY first c' channels
+# 3. Decoder input conv: slice weights[:, :c'] to handle c' input channels
+# 4. Gradients only flow through active weight slices -> true structured training
+#
+# This differs from naive masking (z * mask) where gradients still flow through
+# all weights. Weight slicing ensures only the active channels are optimized.
+#
+# IMPORTANT: Paper shows DC-AE 1.5 is NOT recommended for small channel counts (c=32).
+# Use only for large latent channels (c=64, c=128). For c=32, standard DC-AE is better.
+#
+# Usage:
+#   python -m medgen.scripts.train_dcae dcae=f64 dcae.structured_latent.enabled=true
+structured_latent:
+  enabled: false
+  # Channel steps: [min_channels, min+step, min+2*step, ..., latent_channels]
+  # Paper uses: [16, 20, 24, ..., c] with step=4, min=16
+  min_channels: 16
+  channel_step: 4
+  # Computed at runtime:
+  #   c=32:  [16, 20, 24, 28, 32]
+  #   c=128: [16, 20, 24, 28, ..., 128]

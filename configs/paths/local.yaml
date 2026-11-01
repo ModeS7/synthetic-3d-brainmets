@@ -1,0 +1,13 @@
+# @package _global_
+# Local development paths (Linux)
+
+paths:
+  name: local
+  data_dir: /path/to/MedicalDataSets/brainmetshare-3
+  model_dir: /path/to/this/repo/runs
+  log_dir: /path/to/this/repo/runs
+  cache_dir: ~/.cache/medgen
+  generated_dir: /path/to/MedicalDataSets/generated
+
+  # Dataset-specific parameters (BrainMetShare: 256x256 @ 0.94mm/pixel)
+  fov_mm: 240.0  # Field of view in mm

@@ -1,0 +1,70 @@
+# 3D Diffusion Training Configuration
+#
+# DEPRECATED: Use 'python -m medgen.scripts.train model.spatial_dims=3' instead.
+# This config is kept for backward compatibility.
+#
+# Main config for training 3D volumetric diffusion models.
+# Supports both pixel-space and latent-space diffusion.
+#
+# Recommended usage (unified script):
+#   # 3D training via unified train.py
+#   python -m medgen.scripts.train model=default_3d mode=bravo strategy=rflow
+#
+#   # Or with explicit spatial_dims
+#   python -m medgen.scripts.train model.spatial_dims=3 mode=bravo strategy=rflow
+#
+# Legacy usage (deprecated):
+#   # Default: RFlow, bravo mode, 256x256x160 volumes
+#   python -m medgen.scripts.train_diffusion_3d
+#
+#   # With latent diffusion (requires 3D compression checkpoint)
+#   python -m medgen.scripts.train_diffusion_3d \
+#       latent.enabled=true \
+#       latent.compression_checkpoint=runs/compression_3d/.../checkpoint_best.pt
+#
+#   # View resolved config
+#   python -m medgen.scripts.train_diffusion_3d --cfg job
+
+defaults:
+  - model: default_3d     # 3D UNet architecture
+  - strategy: rflow       # ddpm.yaml or rflow.yaml
+  - mode: bravo           # seg.yaml, bravo.yaml, dual.yaml, multi.yaml
+  - training: default     # Training hyperparameters
+  - volume: default       # 3D volume dimensions
+  - paths: local          # local.yaml or cluster.yaml (AFTER training so it can override verbose)
+  - optional pixel_norm: default      # Brain-only pixel normalization
+  - optional latent: default          # Latent diffusion settings
+  - optional space_to_depth: default # Lossless space-to-depth for pixel diffusion
+  - optional wavelet: default        # Haar wavelet decomposition for pixel diffusion
+  - optional controlnet: default     # ControlNet conditioning
+  - _self_
+
+# Path to pretrained checkpoint for weight initialization (model weights only, no optimizer/scheduler).
+# Used for ControlNet Stage 2: load unconditional UNet from Stage 1.
+pretrained_checkpoint: null
+
+# 3D-specific training overrides
+training:
+  batch_size: 1                    # 3D volumes need small batch
+  gradient_checkpointing: true     # Required for 3D memory
+  use_compile: false               # Incompatible with gradient checkpointing
+  perceptual_weight: 0.0           # Disable perceptual loss for 3D
+  logging:
+    msssim: true                   # MONAI 3D MS-SSIM
+    psnr: true
+    lpips: true                    # 2.5D slice-wise
+  # 3D generation metrics - fewer samples since each is a full volume
+  generation_metrics:
+    samples_per_epoch: 1           # 1 volume/epoch (vs 100 for 2D)
+    samples_extended: 4            # 4 volumes at figure_interval
+    samples_test: 10               # 10 volumes for final test
+
+# Hydra configuration
+# Output structure: runs/diffusion_3d/{mode}/{exp_name}{strategy}_{size}_{timestamp}
+# Note: mode.subdir allows overriding directory name (e.g., seg_conditioned uses 'seg')
+hydra:
+  run:
+    dir: ${paths.model_dir}/diffusion_3d/${oc.select:mode.subdir,${mode.name}}/${oc.select:training.name,""}${strategy.name}_${volume.height}x${volume.depth}_${now:%Y%m%d-%H%M%S}
+  sweep:
+    dir: ${paths.model_dir}/diffusion_3d/multirun/${now:%Y%m%d-%H%M%S}
+    subdir: ${hydra.job.num}

@@ -1,0 +1,35 @@
+# Haar wavelet configuration for 3D pixel-space diffusion
+#
+# Lossless 3D Haar wavelet decomposition: frequency subbands instead of pixel rearrangement.
+# [B, 1, 160, 256, 256] -> [B, 8, 80, 128, 128]
+# UNet operates on smaller spatial grid with 8 frequency channels (LLL, LLH, ..., HHH).
+#
+# Two approaches:
+#   exp12 (WDM paper):  rescale=true, normalize=false  — raw DWT on [-1,1] data
+#   exp12b (ours):      rescale=false, normalize=true   — per-subband N(0,1) normalization
+#
+# Usage:
+#   python -m medgen.scripts.train --config-name=diffusion_3d \
+#       wavelet.enabled=true \
+#       volume.height=256 volume.width=256 volume.pad_depth_to=160
+
+# Master switch
+enabled: false
+
+# Per-subband normalization (shift/scale computed from training data)
+# Normalizes each of the 8 wavelet subbands to ~N(0,1).
+# With normalization, rescale has no effect (linear rescaling is absorbed by stats).
+normalize: false
+
+# Rescale [0,1] data to [-1,1] before DWT (WDM paper convention).
+# Only meaningful when normalize=false (raw coefficients).
+# With normalize=true, this is redundant.
+rescale: false
+
+# Brain-only normalization threshold (like pixel_norm=bravo for wavelet space).
+# When > 0, compute per-subband stats excluding |coeff| <= threshold.
+# Background (0.0 in pixel space → 0.0 in all subbands) is excluded from stats
+# but still gets the shift/scale transform applied. Result: brain subbands ~N(0,1),
+# background maps to a constant (e.g. -2.44).
+# 0.0 = use all voxels (default).
+normalize_threshold: 0.0

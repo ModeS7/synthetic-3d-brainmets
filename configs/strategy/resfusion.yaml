@@ -1,0 +1,12 @@
+# Resfusion Strategy: Residual Noise Diffusion
+#
+# Shi et al., NeurIPS 2024. https://github.com/nkicsl/Resfusion
+#
+# Uses SHORT linear schedule (T=12 for restoration, NOT T=1000).
+# Forward: x_t = √ᾱ_t * x₀ + (1-√ᾱ_t) * R + √(1-ᾱ_t) * ε
+# Inference starts from T_acc ≈ 5-12 steps.
+# Data internally scaled to [-1, 1].
+
+name: resfusion
+num_train_timesteps: 12
+prediction_type: resnoise

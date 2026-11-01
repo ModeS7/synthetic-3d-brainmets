@@ -1,0 +1,64 @@
+# VQ-VAE Architecture Configuration
+#
+# Vector Quantized VAE for discrete latent space learning.
+# Based on: https://arxiv.org/abs/2307.15208 (MONAI Generative)
+#
+# Proven config achieves MS-SSIM 0.9689 on medical imaging.
+
+# ============================================================================
+# Vector Quantization Parameters
+# ============================================================================
+# 512 codebook entries: standard for discrete latent spaces
+# Reference: VQ-VAE-2 (Razavi et al., 2019) uses 512
+# Larger codebooks (1024, 2048) show diminishing returns
+num_embeddings: 512
+embedding_dim: 3                 # Latent channels (MONAI: 3)
+commitment_cost: 0.25            # Commitment loss weight
+decay: 0.99                      # EMA decay for codebook updates
+epsilon: 1.0e-5                  # Numerical stability
+
+# ============================================================================
+# Encoder/Decoder Architecture (MONAI proven config)
+# ============================================================================
+# 3 levels: 256->128->64->32 (8x compression)
+channels:
+  - 64
+  - 128
+  - 128
+
+num_res_layers: 2                # Residual blocks per level
+
+num_res_channels:
+  - 64
+  - 128
+  - 128
+
+# Downsampling: stride, kernel_size, dilation, padding
+downsample_parameters:
+  - [2, 4, 1, 1]
+  - [2, 4, 1, 1]
+  - [2, 4, 1, 1]
+
+# Upsampling: stride, kernel_size, dilation, padding, output_padding
+upsample_parameters:
+  - [2, 4, 1, 1, 0]
+  - [2, 4, 1, 1, 0]
+  - [2, 4, 1, 1, 0]
+
+# ============================================================================
+# Loss Weights (MONAI paper values)
+# ============================================================================
+perceptual_weight: 0.002         # Perceptual loss weight
+adv_weight: 0.005                # GAN loss weight
+
+# ============================================================================
+# Discriminator (PatchGAN)
+# ============================================================================
+disc_lr: 5.0e-4                  # Discriminator learning rate
+disc_num_layers: 3               # PatchDiscriminator depth
+disc_num_channels: 64            # Base channels
+
+# ============================================================================
+# Training Options
+# ============================================================================
+disable_gan: false               # Set true for pure VQ-VAE (no adversarial)

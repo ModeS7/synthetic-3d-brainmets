@@ -1,0 +1,10 @@
+# DC-AE 3D f32_d4: 32x spatial, 4x depth compression
+# Input: 256x256x160 -> Latent: 8x8x40x32
+#
+# ⚠️  DEPRECATED: See configs/dcae_3d/default.yaml for rationale.
+# This is the default configuration (legacy).
+defaults:
+  - default
+
+latent_channels: 32
+scaling_factor: 1.0  # Will need calibration from training data

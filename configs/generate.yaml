@@ -1,0 +1,140 @@
+# Generation Configuration
+#
+# Generate synthetic medical images/volumes using trained diffusion models.
+#
+# Usage:
+#   # 2D: seg -> bravo pipeline (local)
+#   python -m medgen.scripts.generate mode=bravo \
+#       seg_model=runs/seg/model.pt image_model=runs/bravo/model.pt
+#
+#   # 3D: size_bins -> seg -> bravo pipeline (cluster)
+#   python -m medgen.scripts.generate paths=cluster spatial_dims=3 mode=bravo \
+#       seg_model=runs/seg/checkpoint.pt image_model=runs/bravo/checkpoint.pt
+#
+#   # Generate only seg masks (3D)
+#   python -m medgen.scripts.generate spatial_dims=3 mode=seg_conditioned \
+#       seg_model=runs/seg_conditioned/checkpoint.pt
+
+defaults:
+  - paths: local
+  - _self_
+
+# Core settings
+spatial_dims: 2           # 2 for images, 3 for volumes
+strategy: rflow           # ddpm or rflow
+gen_mode: bravo           # bravo, dual, seg_conditioned
+
+# Model paths (relative to working dir or absolute)
+seg_model: null           # Path to trained segmentation model
+image_model: null         # Path to trained image model (bravo or dual)
+
+# Two-model bravo handoff (optional, for low-t-fine-tuned variants like exp48).
+# When `image_model_high_t` is set, sampling uses `image_model_high_t` for
+# t > handoff_t * 1000 and `image_model` (the low-t fine-tune) for the rest.
+image_model_high_t: null  # Optional high-t bravo checkpoint
+handoff_t: 0.25           # Normalized timestep at which to switch (MONAI t in [0, 1])
+
+# Dimensions
+image_size: 128           # Image height/width
+depth: 160                # Volume depth for 3D (generation depth)
+trim_slices: 10           # Trim last N slices from 3D output (training pads 10, so remove them)
+
+# Field of view in mm (used to compute voxel spacing)
+# Voxel spacing = fov_mm / image_size (e.g., 240/128 = 1.875mm)
+fov_mm: 240.0
+
+# Generation settings
+batch_size: 8             # Batch size (auto-reduced for 3D)
+num_images: 1000          # Number of samples to generate
+num_steps: 50             # Number of diffusion steps (used as default for both models)
+num_steps_seg: null       # Override steps for seg model (null = use num_steps)
+num_steps_bravo: null     # Override steps for bravo/image model (null = use num_steps)
+current_image: 0          # Starting counter for resuming
+seed: null                # Base generation seed (null preserves stochastic generation)
+
+# Size bin settings (for seg_conditioned or 3D seg generation)
+size_bins: null           # Fixed size bins as comma-separated ints, e.g., "0,0,1,0,0,0,1"
+min_tumors: 1             # Minimum tumors when random sampling
+max_tumors: 5             # Maximum tumors when random sampling
+
+# Classifier-free guidance scales (1.0 = no guidance, >1.0 = stronger conditioning)
+cfg_scale_seg: 1.0        # CFG for seg generation (size bin conditioning)
+cfg_scale_bravo: 1.0      # CFG for bravo generation (seg mask conditioning)
+
+# Dynamic CFG: linearly interpolate from cfg_scale (at t=T) to cfg_scale_end (at t=0)
+# Set to null to use constant CFG, or set to 1.0 for "high CFG early, no CFG late"
+cfg_scale_seg_end: null   # Ending CFG for seg (null = constant)
+cfg_scale_bravo_end: null # Ending CFG for bravo (null = constant)
+
+# CFG mode: 'standard' (Ho & Salimans) or 'zero_star' (CFG-Zero*, Fan et al. 2025)
+# zero_star uses optimized scale s* and zero-init for first K steps
+cfg_mode: standard
+cfg_zero_init_steps: 1    # Zero-velocity steps for zero_star mode
+
+# Time-shift ratio for RFlow sampling (SD3-style schedule shift)
+# 1.0 = no shift, >1 = bias toward higher noise levels
+# Set per-model: shift_ratio_seg and shift_ratio_bravo override shift_ratio
+shift_ratio: 1.0               # Default (no shift)
+shift_ratio_seg: null           # Override for seg model (null = use shift_ratio)
+shift_ratio_bravo: null         # Override for bravo/image model (null = use shift_ratio)
+
+# ODE solver for generation (requires torchdiffeq for non-euler solvers)
+# Options: euler (default), midpoint, rk4, dopri5
+ode_solver: euler
+ode_atol: 1e-5                    # Absolute tolerance (dopri5 only)
+ode_rtol: 1e-5                    # Relative tolerance (dopri5 only)
+
+# Generated seg-mask artifact filtering (3D: per-slice foreground guard)
+max_white_percentage: 0.04   # Max tumor percentage per slice (4%)
+max_retries: 10              # Total deterministic draws allowed per accepted seg mask
+
+# Validation settings (seg_conditioned)
+validate_size_bins: true         # Validate generated tumors match requested size bins
+seg_component_connectivity: 6    # Historical default; locked mask-pool protocol uses 26
+validate_brain_mask: true        # Validate tumors are inside brain mask (3D)
+brain_threshold: 0.05            # Brain mask intensity threshold
+brain_tolerance: 0.0             # Tolerance for tumor-outside-brain overlap
+brain_dilate_pixels: 0           # Dilate brain mask by N pixels before validation
+max_brain_retries: 5             # Max retries for brain mask validation
+conditioning_brain_qc_mode: cleanup # "reject" retries images without changing fixed masks
+brain_containment_margin_mm: 3.0 # Physical boundary allowance in reject mode
+max_image_attempts_per_mask: null # Explicit fixed-mask cap in reject mode
+skip_failed_fixed_masks: false   # Continue to the next fixed mask when the image-attempt cap is exhausted
+save_rejected_dir: null          # Keep draws that fail containment (null = discard, as the protocol does)
+stop_after_accepted_images: null # Stop a fixed-mask run after this many newly accepted images
+brain_atlas_path: auto           # "auto" = use bundled atlas, path = custom, null = skip
+brain_pca_path: null             # "auto" = use bundled PCA model, path = custom, null = skip
+brain_support_pca_path: null     # Train-derived PCA support used only by fixed-mask reject QC
+seg_pca_path: null               # "auto" = use bundled seg PCA model, path = custom, null = skip
+real_seg_dir: null               # Path to dir with real seg masks (*/seg.nii.gz). Skips seg generation.
+expected_real_cases: null        # If set, require exactly this many unique masks in real_seg_dir
+expected_real_depth: null        # If set, require this exact input-mask depth before pad/crop
+require_real_bravo_pairs: false  # Require bravo.nii.gz beside every real conditioning mask
+validate_real_seg_masks: true    # Reject non-finite, empty, or wrong in-plane real masks
+
+# Optional post-processing of generated image backgrounds.
+mask_outside_brain: true
+mask_outside_brain_dilate_pixels: 2
+
+# Size bin parameters (used when size_bins is null for random sampling)
+bin_edges: [0, 3, 6, 10, 15, 20, 30]  # Feret diameter bin edges (mm)
+num_bins: 7                             # Number of size bins
+max_count: 10                           # Max tumor count per bin (for normalization)
+
+# DiffRS (Diffusion Rejection Sampling) — opt-in, null = disabled
+# Requires a trained DiffRS head checkpoint (see train_diffrs_discriminator.py)
+diffrs_checkpoint: null           # Path to DiffRS head checkpoint
+diffrs_rej_percentile: 0.75      # Quantile for acceptance threshold (official default)
+diffrs_backsteps: 1              # Timesteps to backstep on rejection (official default)
+diffrs_max_iter: 999999          # Max NFE per sample before full re-init
+diffrs_iter_warmup: 10           # Warmup iterations for threshold estimation
+
+# Output settings
+output_subdir: ""         # Subdirectory under generated_dir (e.g., "3d_full_pipeline")
+verbose: true             # Enable progress bars (false for cluster)
+
+# Hydra configuration
+hydra:
+  run:
+    dir: .                # Don't create Hydra output dirs for generation
+  output_subdir: null     # Disable .hydra subdirectory

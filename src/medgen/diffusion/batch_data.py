@@ -1,0 +1,140 @@
+"""Standardized batch data structure for all training modes."""
+import warnings
+from dataclasses import dataclass
+
+import torch
+from torch import Tensor
+
+# Max num_bins supported by the tuple-format heuristic. Configs with num_bins above
+# this must switch to the dict batch format (see from_raw). Default is 7 (project rule).
+_MAX_SIZE_BINS_HEURISTIC = 10
+
+
+@dataclass
+class BatchData:
+    """Standardized batch data structure.
+
+    All modes unpack to this format, eliminating scattered tuple handling.
+    """
+    images: Tensor
+    labels: Tensor | None = None
+    size_bins: Tensor | None = None
+    bin_maps: Tensor | None = None
+    mode_id: Tensor | None = None
+
+    @classmethod
+    def from_raw(cls, data: Tensor | tuple | list | dict) -> 'BatchData':
+        """Convert any batch format to standardized BatchData.
+
+        Handles:
+        - Tensor: Simple image batch
+        - Dict: {'image': ..., 'seg': ..., ...} or {'images': ..., 'labels': ..., ...}
+        - 2-tuple: (images, labels) or (seg, size_bins) [deprecated]
+        - 3-tuple: (seg, size_bins, bin_maps) or (image, seg, mode_id) [deprecated]
+        """
+        if isinstance(data, Tensor):
+            return cls(images=data)
+
+        if isinstance(data, dict):
+            # Support both 'image'/'seg' and 'images'/'labels' keys
+            # Use explicit None checks to avoid tensor boolean ambiguity
+            images = data.get('image')
+            if images is None:
+                images = data.get('images')
+            if images is None:
+                images = data.get('latent')
+            if images is None:
+                raise ValueError(
+                    f"BatchData.from_raw: dict must contain 'image', 'images', or 'latent' key, "
+                    f"got keys: {list(data.keys())}"
+                )
+
+            labels = data.get('seg')
+            if labels is None:
+                labels = data.get('labels')
+            if labels is None:
+                labels = data.get('latent_seg')
+
+            return cls(
+                images=images,
+                labels=labels,
+                size_bins=data.get('size_bins'),
+                bin_maps=data.get('bin_maps'),
+                mode_id=data.get('mode_id'),
+            )
+
+        # Deprecated tuple format - keep for backwards compatibility
+        if isinstance(data, (tuple, list)):
+            warnings.warn(
+                "Tuple batch format is deprecated. Update dataloader to return dict.",
+                DeprecationWarning,
+                stacklevel=2
+            )
+            if len(data) == 2:
+                first, second = data
+
+                # Validate types before calling .dim()
+                if not isinstance(first, Tensor):
+                    raise TypeError(
+                        f"BatchData.from_raw: first element is {type(first).__name__}, expected Tensor"
+                    )
+                if not isinstance(second, Tensor):
+                    raise TypeError(
+                        f"BatchData.from_raw: second element is {type(second).__name__}, expected Tensor"
+                    )
+
+                # Distinguish (images, labels) from (seg, size_bins)
+                # size_bins: [B] (pre-collation) or [B, num_bins] (post-collation, num_bins <= _MAX_SIZE_BINS_HEURISTIC)
+                # labels/seg: [B, 1, H, W] (dim >= 3, or dim == 2 with shape[1] > _MAX_SIZE_BINS_HEURISTIC)
+                # NOTE: any future config with num_bins > _MAX_SIZE_BINS_HEURISTIC must switch
+                # to the dict batch format (the deprecated tuple path can't disambiguate).
+                if second.dim() == 1 or (second.dim() == 2 and second.shape[1] <= _MAX_SIZE_BINS_HEURISTIC):
+                    return cls(images=first, size_bins=second)
+                else:
+                    return cls(images=first, labels=second)
+
+            elif len(data) == 3:
+                first, second, third = data
+
+                # Validate types before calling .dim()
+                for i, elem in enumerate([first, second, third]):
+                    if not isinstance(elem, Tensor):
+                        raise TypeError(
+                            f"BatchData.from_raw: element {i} is {type(elem).__name__}, expected Tensor"
+                        )
+
+                # Same heuristic: size_bins has dim <= 2 with small last dim
+                if second.dim() == 1 or (second.dim() == 2 and second.shape[1] <= _MAX_SIZE_BINS_HEURISTIC):
+                    return cls(images=first, size_bins=second, bin_maps=third)
+                else:
+                    return cls(images=first, labels=second, mode_id=third)
+
+            else:
+                raise ValueError(f"Unexpected tuple length: {len(data)}")
+
+        raise ValueError(f"Unknown batch format: {type(data)}")
+
+    def to_device(self, device: torch.device) -> 'BatchData':
+        """Move all tensors to device.
+
+        Handles MONAI MetaTensors by converting to regular tensors first
+        to avoid metadata issues during device transfer.
+        """
+        def _move(x: Tensor | None) -> Tensor | None:
+            if x is None:
+                return None
+            # Handle MONAI MetaTensors - convert to plain tensor first
+            if hasattr(x, 'as_tensor'):
+                result: Tensor = x.as_tensor().to(device)
+                return result
+            return x.to(device)
+
+        images = _move(self.images)
+        assert images is not None, "BatchData.images must not be None"
+        return BatchData(
+            images=images,
+            labels=_move(self.labels),
+            size_bins=_move(self.size_bins),
+            bin_maps=_move(self.bin_maps),
+            mode_id=_move(self.mode_id),
+        )

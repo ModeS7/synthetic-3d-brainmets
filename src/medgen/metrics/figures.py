@@ -1,0 +1,311 @@
+"""
+Reconstruction figure visualization utilities.
+
+Shared function for worst_batch, validation, and test visualizations.
+Works for both VAE (no timesteps) and Diffusion (with timesteps).
+"""
+import io
+
+import matplotlib
+
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+
+from .visualization_constants import (
+    DIFFERENCE_HEATMAP_COLORMAP,
+    DUAL_FIGURE_HEIGHT,
+    FIGURE_HSPACE,
+    FIGURE_LABEL_FONTSIZE,
+    FIGURE_SUPTITLE_FONTSIZE,
+    FIGURE_TITLE_FONTSIZE,
+    FIGURE_WSPACE,
+    GRAYSCALE_COLORMAP,
+    IMAGE_VALUE_MAX,
+    IMAGE_VALUE_MIN,
+    MASK_CONTOUR_ALPHA,
+    MASK_CONTOUR_COLOR,
+    MASK_CONTOUR_LINEWIDTH,
+    SINGLE_FIGURE_HEIGHT,
+    SINGLE_FIGURE_WIDTH_PER_SAMPLE,
+)
+
+
+def create_reconstruction_figure(
+    original: torch.Tensor | dict[str, torch.Tensor],
+    generated: torch.Tensor | dict[str, torch.Tensor],
+    title: str | None = None,
+    timesteps: torch.Tensor | None = None,
+    mask: torch.Tensor | None = None,
+    max_samples: int = 8,
+    metrics: dict[str, float] | None = None,
+) -> plt.Figure:
+    """Create reconstruction visualization figure.
+
+    Shared function for worst_batch, validation, and test visualizations.
+    Works for both VAE (no timesteps) and Diffusion (with timesteps).
+
+    Layout:
+    - Single mode: 3 rows (Original, Generated, Difference)
+    - Dual mode: 6 rows (Original_ch1, Generated_ch1, Diff_ch1, Original_ch2, ...)
+
+    Args:
+        original: Ground truth images [B, C, H, W] or dict of channel tensors.
+        generated: Generated images [B, C, H, W] or dict of channel tensors.
+        title: Optional title for the figure.
+        timesteps: Optional per-sample timesteps [B] (shown in column titles).
+        mask: Optional segmentation mask [B, 1, H, W] for contour overlay.
+        max_samples: Maximum number of samples to display.
+        metrics: Optional dict of metrics to show in subtitle (e.g., {'MS-SSIM': 0.95}).
+
+    Returns:
+        Matplotlib figure.
+    """
+    is_dual = isinstance(original, dict)
+
+    if is_dual:
+        return _create_dual_reconstruction_figure(
+            original, generated, title, timesteps, mask, max_samples, metrics
+        )
+    else:
+        return _create_single_reconstruction_figure(
+            original, generated, title, timesteps, mask, max_samples, metrics
+        )
+
+
+def _create_single_reconstruction_figure(
+    original: torch.Tensor,
+    generated: torch.Tensor,
+    title: str | None,
+    timesteps: torch.Tensor | None,
+    mask: torch.Tensor | None,
+    max_samples: int,
+    metrics: dict[str, float] | None,
+) -> plt.Figure:
+    """Create figure for single-channel reconstruction (seg, bravo modes)."""
+    # Convert to numpy (float() handles bfloat16 -> float32)
+    if isinstance(original, torch.Tensor):
+        orig_np = original.cpu().float().numpy()
+        gen_np = generated.cpu().float().numpy()
+    else:
+        orig_np = original
+        gen_np = generated
+
+    n_samples = min(max_samples, orig_np.shape[0])
+
+    # Use first channel
+    orig_ch = orig_np[:n_samples, 0]
+    gen_ch = gen_np[:n_samples, 0]
+
+    # Handle 3D volumes [n_samples, D, H, W] by taking middle slice
+    if orig_ch.ndim == 4:
+        mid_slice = orig_ch.shape[1] // 2
+        orig_ch = orig_ch[:, mid_slice]  # [n_samples, H, W]
+        gen_ch = gen_ch[:, mid_slice]
+
+    diff = np.abs(orig_ch - gen_ch)
+
+    mask_np = None
+    if mask is not None:
+        mask_np = mask.cpu().float().numpy() if isinstance(mask, torch.Tensor) else mask
+        # Handle 3D masks [B, C, D, H, W] by taking middle slice
+        if mask_np.ndim == 5:
+            mid_slice = mask_np.shape[2] // 2
+            mask_np = mask_np[:, :, mid_slice]  # [B, C, H, W]
+
+    # Create figure with minimal spacing - tight layout
+    fig, axes = plt.subplots(
+        3, n_samples, figsize=(SINGLE_FIGURE_WIDTH_PER_SAMPLE * n_samples, SINGLE_FIGURE_HEIGHT),
+        gridspec_kw={'hspace': FIGURE_HSPACE, 'wspace': FIGURE_WSPACE}
+    )
+    if n_samples == 1:
+        axes = axes.reshape(3, 1)
+
+    row_labels = ['Original', 'Generated', '|Diff|']
+
+    for i in range(n_samples):
+        # Column title with timestep if provided
+        if timesteps is not None:
+            t_val = timesteps[i].item() if isinstance(timesteps, torch.Tensor) else timesteps[i]
+            axes[0, i].set_title(f't={t_val:.0f}', fontsize=FIGURE_TITLE_FONTSIZE, pad=2)
+
+        # Row 1: Original
+        axes[0, i].imshow(np.clip(orig_ch[i], IMAGE_VALUE_MIN, IMAGE_VALUE_MAX),
+                          cmap=GRAYSCALE_COLORMAP, vmin=IMAGE_VALUE_MIN, vmax=IMAGE_VALUE_MAX)
+        axes[0, i].axis('off')
+
+        # Row 2: Generated (with optional mask contour)
+        axes[1, i].imshow(np.clip(gen_ch[i], IMAGE_VALUE_MIN, IMAGE_VALUE_MAX),
+                          cmap=GRAYSCALE_COLORMAP, vmin=IMAGE_VALUE_MIN, vmax=IMAGE_VALUE_MAX)
+        if mask_np is not None and mask_np.shape[0] > i:
+            axes[1, i].contour(mask_np[i, 0], colors=MASK_CONTOUR_COLOR,
+                               linewidths=MASK_CONTOUR_LINEWIDTH, alpha=MASK_CONTOUR_ALPHA)
+        axes[1, i].axis('off')
+
+        # Row 3: Difference heatmap
+        axes[2, i].imshow(diff[i], cmap=DIFFERENCE_HEATMAP_COLORMAP, vmin=0, vmax=diff.max())
+        axes[2, i].axis('off')
+
+    # Add row labels on the left side
+    for row, label in enumerate(row_labels):
+        axes[row, 0].text(-0.02, 0.5, label, transform=axes[row, 0].transAxes,
+                          fontsize=FIGURE_LABEL_FONTSIZE, va='center', ha='right', rotation=90)
+
+    # Build title
+    full_title = title or ''
+    if metrics:
+        metrics_str = ' | '.join(f'{k}: {v:.4f}' for k, v in metrics.items())
+        if full_title:
+            full_title = f'{full_title}\n{metrics_str}'
+        else:
+            full_title = metrics_str
+
+    if full_title:
+        fig.suptitle(full_title, fontsize=FIGURE_SUPTITLE_FONTSIZE, y=0.98)
+
+    # Tight margins - minimal whitespace
+    fig.subplots_adjust(left=0.05, right=0.98, top=0.92, bottom=0.02,
+                        hspace=FIGURE_HSPACE, wspace=FIGURE_WSPACE)
+    return fig
+
+
+def _create_dual_reconstruction_figure(
+    original: dict[str, torch.Tensor],
+    generated: dict[str, torch.Tensor],
+    title: str | None,
+    timesteps: torch.Tensor | None,
+    mask: torch.Tensor | None,
+    max_samples: int,
+    metrics: dict[str, float] | None,
+) -> plt.Figure:
+    """Create figure for dual-channel reconstruction (dual mode)."""
+    keys = list(original.keys())
+    key1, key2 = keys[0], keys[1]
+
+    # Convert to numpy (float() handles bfloat16 -> float32)
+    orig1 = original[key1].cpu().float().numpy() if isinstance(original[key1], torch.Tensor) else original[key1]
+    orig2 = original[key2].cpu().float().numpy() if isinstance(original[key2], torch.Tensor) else original[key2]
+    gen1 = generated[key1].cpu().float().numpy() if isinstance(generated[key1], torch.Tensor) else generated[key1]
+    gen2 = generated[key2].cpu().float().numpy() if isinstance(generated[key2], torch.Tensor) else generated[key2]
+
+    n_samples = min(max_samples, orig1.shape[0])
+
+    # Use first channel of each
+    orig1_ch = orig1[:n_samples, 0]
+    orig2_ch = orig2[:n_samples, 0]
+    gen1_ch = gen1[:n_samples, 0]
+    gen2_ch = gen2[:n_samples, 0]
+
+    # Handle 3D volumes [n_samples, D, H, W] by taking middle slice
+    if orig1_ch.ndim == 4:
+        mid_slice = orig1_ch.shape[1] // 2
+        orig1_ch = orig1_ch[:, mid_slice]
+        orig2_ch = orig2_ch[:, mid_slice]
+        gen1_ch = gen1_ch[:, mid_slice]
+        gen2_ch = gen2_ch[:, mid_slice]
+
+    diff1 = np.abs(orig1_ch - gen1_ch)
+    diff2 = np.abs(orig2_ch - gen2_ch)
+
+    mask_np = None
+    if mask is not None:
+        mask_np = mask.cpu().float().numpy() if isinstance(mask, torch.Tensor) else mask
+        # Handle 3D masks [B, C, D, H, W] by taking middle slice
+        if mask_np.ndim == 5:
+            mid_slice = mask_np.shape[2] // 2
+            mask_np = mask_np[:, :, mid_slice]
+
+    # Create figure: 6 rows (3 per channel) with minimal spacing
+    fig, axes = plt.subplots(
+        6, n_samples, figsize=(SINGLE_FIGURE_WIDTH_PER_SAMPLE * n_samples, DUAL_FIGURE_HEIGHT),
+        gridspec_kw={'hspace': FIGURE_HSPACE, 'wspace': FIGURE_WSPACE}
+    )
+    if n_samples == 1:
+        axes = axes.reshape(6, 1)
+
+    # Row labels based on key names
+    label1 = key1.replace('_', ' ').title()
+    label2 = key2.replace('_', ' ').title()
+    row_labels = [
+        f'GT {label1}', f'Pred {label1}', f'|Diff| {label1}',
+        f'GT {label2}', f'Pred {label2}', f'|Diff| {label2}'
+    ]
+
+    for i in range(n_samples):
+        # Column title with timestep if provided
+        if timesteps is not None:
+            t_val = timesteps[i].item() if isinstance(timesteps, torch.Tensor) else timesteps[i]
+            axes[0, i].set_title(f't={t_val:.0f}', fontsize=FIGURE_TITLE_FONTSIZE, pad=2)
+
+        # Channel 1
+        axes[0, i].imshow(np.clip(orig1_ch[i], IMAGE_VALUE_MIN, IMAGE_VALUE_MAX),
+                          cmap=GRAYSCALE_COLORMAP, vmin=IMAGE_VALUE_MIN, vmax=IMAGE_VALUE_MAX)
+        axes[0, i].axis('off')
+
+        axes[1, i].imshow(np.clip(gen1_ch[i], IMAGE_VALUE_MIN, IMAGE_VALUE_MAX),
+                          cmap=GRAYSCALE_COLORMAP, vmin=IMAGE_VALUE_MIN, vmax=IMAGE_VALUE_MAX)
+        if mask_np is not None and mask_np.shape[0] > i:
+            axes[1, i].contour(mask_np[i, 0], colors=MASK_CONTOUR_COLOR,
+                               linewidths=MASK_CONTOUR_LINEWIDTH, alpha=MASK_CONTOUR_ALPHA)
+        axes[1, i].axis('off')
+
+        axes[2, i].imshow(diff1[i], cmap=DIFFERENCE_HEATMAP_COLORMAP, vmin=0, vmax=diff1.max())
+        axes[2, i].axis('off')
+
+        # Channel 2
+        axes[3, i].imshow(np.clip(orig2_ch[i], IMAGE_VALUE_MIN, IMAGE_VALUE_MAX),
+                          cmap=GRAYSCALE_COLORMAP, vmin=IMAGE_VALUE_MIN, vmax=IMAGE_VALUE_MAX)
+        axes[3, i].axis('off')
+
+        axes[4, i].imshow(np.clip(gen2_ch[i], IMAGE_VALUE_MIN, IMAGE_VALUE_MAX),
+                          cmap=GRAYSCALE_COLORMAP, vmin=IMAGE_VALUE_MIN, vmax=IMAGE_VALUE_MAX)
+        if mask_np is not None and mask_np.shape[0] > i:
+            axes[4, i].contour(mask_np[i, 0], colors=MASK_CONTOUR_COLOR,
+                               linewidths=MASK_CONTOUR_LINEWIDTH, alpha=MASK_CONTOUR_ALPHA)
+        axes[4, i].axis('off')
+
+        axes[5, i].imshow(diff2[i], cmap=DIFFERENCE_HEATMAP_COLORMAP, vmin=0, vmax=diff2.max())
+        axes[5, i].axis('off')
+
+    # Add row labels on the left side
+    for row, label in enumerate(row_labels):
+        axes[row, 0].text(-0.02, 0.5, label, transform=axes[row, 0].transAxes,
+                          fontsize=FIGURE_TITLE_FONTSIZE, va='center', ha='right', rotation=90)
+
+    # Build title
+    full_title = title or ''
+    if metrics:
+        metrics_str = ' | '.join(f'{k}: {v:.4f}' for k, v in metrics.items())
+        if full_title:
+            full_title = f'{full_title}\n{metrics_str}'
+        else:
+            full_title = metrics_str
+
+    if full_title:
+        fig.suptitle(full_title, fontsize=FIGURE_SUPTITLE_FONTSIZE, y=0.98)
+
+    # Tight margins - minimal whitespace
+    fig.subplots_adjust(left=0.06, right=0.98, top=0.94, bottom=0.02,
+                        hspace=FIGURE_HSPACE, wspace=FIGURE_WSPACE)
+    return fig
+
+
+def figure_to_buffer(fig: plt.Figure, dpi: int = 150) -> io.BytesIO:
+    """Convert matplotlib figure to PNG buffer and close figure.
+
+    Use this to safely convert figures for TensorBoard logging without
+    memory leaks. The figure is closed after conversion.
+
+    Args:
+        fig: Matplotlib figure to convert.
+        dpi: Resolution for saved figure. Default 150 for good quality.
+
+    Returns:
+        BytesIO buffer containing PNG image data.
+    """
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=dpi, bbox_inches='tight')
+    buf.seek(0)
+    plt.close(fig)  # Prevent memory leak
+    return buf

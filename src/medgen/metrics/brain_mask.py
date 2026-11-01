@@ -1,0 +1,500 @@
+"""
+Brain mask utilities for validating generated segmentation masks.
+
+Detects if tumor segmentation falls outside the brain volume outline.
+Uses morphological operations to handle internal low-intensity regions
+(ventricles, CSF) and boundary cases correctly.
+"""
+import logging
+from pathlib import Path
+
+import numpy as np
+import torch
+from scipy import ndimage
+
+logger = logging.getLogger(__name__)
+
+
+def create_brain_mask(
+    image: torch.Tensor | np.ndarray,
+    threshold: float = 0.05,
+    fill_holes: bool = True,
+    dilate_pixels: int = 3,
+) -> np.ndarray:
+    """Create a brain mask from MRI image using morphological operations.
+
+    Handles internal low-intensity regions (ventricles, CSF) by:
+    1. Thresholding to get initial tissue estimate
+    2. Keeping only the largest connected component (brain)
+    3. Filling internal holes to include ventricles
+    4. Dilating to allow tumors at the boundary
+
+    Args:
+        image: MRI image, any shape (batch/channel dims are squeezed).
+        threshold: Intensity threshold for initial brain detection.
+        fill_holes: Whether to fill internal holes (recommended).
+        dilate_pixels: Number of pixels to dilate brain mask (handles boundary tumors).
+
+    Returns:
+        Binary brain mask as numpy array (same spatial shape as input).
+    """
+    # Convert to numpy
+    if isinstance(image, torch.Tensor):
+        image = image.detach().cpu().numpy()
+
+    # Remove batch/channel dimensions
+    image = np.squeeze(image)
+
+    # Initial threshold
+    binary = image > threshold
+
+    # Find connected components
+    labeled, n_components = ndimage.label(binary)
+
+    if n_components == 0:
+        return np.zeros_like(image, dtype=bool)
+
+    # Find largest component (the brain)
+    component_sizes = ndimage.sum(binary, labeled, range(1, n_components + 1))
+    largest_label = np.argmax(component_sizes) + 1
+    brain_mask = labeled == largest_label
+
+    # Fill internal holes (ventricles, CSF cavities)
+    if fill_holes:
+        brain_mask = ndimage.binary_fill_holes(brain_mask)
+
+    # Dilate to allow tumors at the boundary
+    if dilate_pixels > 0:
+        brain_mask = ndimage.binary_dilation(brain_mask, iterations=dilate_pixels)
+
+    return brain_mask
+
+
+def is_seg_inside_brain(
+    image: torch.Tensor | np.ndarray,
+    seg: torch.Tensor | np.ndarray,
+    brain_threshold: float = 0.05,
+    tolerance: float = 0.05,
+    dilate_pixels: int = 3,
+) -> bool:
+    """Check if segmentation mask is inside the brain volume.
+
+    Args:
+        image: MRI image (any shape with optional batch/channel dims).
+        seg: Segmentation mask (same shape as image).
+        brain_threshold: Intensity threshold for brain detection.
+        tolerance: Maximum allowed ratio of outside pixels (0-1).
+        dilate_pixels: Pixels to dilate brain mask (handles boundary tumors).
+
+    Returns:
+        True if segmentation is valid (inside brain), False otherwise.
+    """
+    result = compute_outside_brain_ratio(image, seg, brain_threshold, dilate_pixels)
+    return result['outside_ratio'] <= tolerance
+
+
+def compute_outside_brain_ratio(
+    image: torch.Tensor | np.ndarray,
+    seg: torch.Tensor | np.ndarray,
+    brain_threshold: float = 0.05,
+    dilate_pixels: int = 3,
+) -> dict[str, float | int]:
+    """Compute ratio of segmentation pixels outside the brain.
+
+    Args:
+        image: MRI image.
+        seg: Segmentation mask.
+        brain_threshold: Intensity threshold for brain detection.
+        dilate_pixels: Pixels to dilate brain mask (handles boundary tumors).
+
+    Returns:
+        Dict with 'outside_ratio', 'n_tumor_pixels', 'n_outside_pixels'.
+    """
+    # Convert to numpy
+    if isinstance(image, torch.Tensor):
+        image = image.detach().cpu().numpy()
+    if isinstance(seg, torch.Tensor):
+        seg = seg.detach().cpu().numpy()
+
+    # Remove batch/channel dimensions
+    image = np.squeeze(image)
+    seg = np.squeeze(seg)
+
+    # Create brain mask with filled holes and dilation
+    brain_mask = create_brain_mask(
+        image,
+        threshold=brain_threshold,
+        fill_holes=True,
+        dilate_pixels=dilate_pixels,
+    )
+
+    # Binarize segmentation
+    tumor_mask = seg > 0.5
+
+    # Find tumor pixels outside brain
+    tumor_outside = tumor_mask & ~brain_mask
+
+    n_tumor = int(tumor_mask.sum())
+    n_outside = int(tumor_outside.sum())
+
+    if n_tumor == 0:
+        return {
+            'outside_ratio': 0.0,
+            'n_tumor_pixels': 0,
+            'n_outside_pixels': 0,
+        }
+
+    return {
+        'outside_ratio': float(n_outside / n_tumor),
+        'n_tumor_pixels': n_tumor,
+        'n_outside_pixels': n_outside,
+    }
+
+
+def evaluate_conditioning_brain_containment(
+    image: torch.Tensor | np.ndarray,
+    seg: torch.Tensor | np.ndarray,
+    *,
+    brain_threshold: float = 0.05,
+    margin_mm: float = 3.0,
+    voxel_spacing_mm: tuple[float, float, float] = (1.0, 1.0, 1.0),
+    brain_support_pca: 'BrainPCAModel | None' = None,
+) -> dict[str, bool | float | None]:
+    """Check that every conditioning-positive voxel is near the brain support.
+
+    When ``brain_support_pca`` is provided, the intensity-derived main-brain
+    mask is projected onto the training-set PCA model before distances are
+    measured. This prevents generated tissue around an implausibly placed
+    conditioning lesion from validating itself.
+    """
+    if isinstance(image, torch.Tensor):
+        image = image.detach().cpu().numpy()
+    if isinstance(seg, torch.Tensor):
+        seg = seg.detach().cpu().numpy()
+    image = np.squeeze(image)
+    seg = np.squeeze(seg)
+
+    if image.ndim != 3 or seg.ndim != 3:
+        raise ValueError(
+            "Conditioning-brain containment requires 3D image and mask arrays"
+        )
+    if image.shape != seg.shape:
+        raise ValueError(
+            f"Image shape {image.shape} does not match conditioning-mask shape {seg.shape}"
+        )
+    if not np.isfinite(image).all() or not np.isfinite(seg).all():
+        raise ValueError("Image and conditioning mask must contain only finite values")
+    if not np.isfinite(brain_threshold) or not 0.0 <= brain_threshold <= 1.0:
+        raise ValueError("brain_threshold must be in [0, 1]")
+    if not np.isfinite(margin_mm) or margin_mm < 0.0:
+        raise ValueError("margin_mm must be non-negative")
+    if len(voxel_spacing_mm) != 3 or any(
+        not np.isfinite(float(value)) or float(value) <= 0.0
+        for value in voxel_spacing_mm
+    ):
+        raise ValueError("voxel_spacing_mm must contain three positive values")
+
+    tumor_mask = seg > 0.5
+    if not np.any(tumor_mask):
+        return {'valid': True, 'max_distance_mm': 0.0}
+
+    brain_mask = create_brain_mask(
+        image,
+        threshold=brain_threshold,
+        fill_holes=True,
+        dilate_pixels=0,
+    )
+    if not np.any(brain_mask):
+        return {'valid': False, 'max_distance_mm': None}
+    if brain_support_pca is not None:
+        brain_mask = brain_support_pca.reconstruct_support(brain_mask)
+        if not np.any(brain_mask):
+            return {'valid': False, 'max_distance_mm': None}
+
+    distance_mm = ndimage.distance_transform_edt(
+        ~brain_mask,
+        sampling=tuple(float(value) for value in voxel_spacing_mm),
+    )
+    maximum_distance = float(distance_mm[tumor_mask].max())
+    return {
+        'valid': maximum_distance <= float(margin_mm) + 1e-6,
+        'max_distance_mm': maximum_distance,
+    }
+
+
+def load_brain_atlas(atlas_path: str | Path, expected_shape: tuple[int, ...] | None = None) -> np.ndarray:
+    """Load a pre-computed brain atlas from NIfTI file.
+
+    Args:
+        atlas_path: Path to atlas NIfTI file (stored as [H, W, D]).
+        expected_shape: If provided, validate atlas matches (D, H, W).
+
+    Returns:
+        Bool array [D, H, W].
+    """
+    import nibabel as nib
+
+    atlas_path = Path(atlas_path)
+    if not atlas_path.exists():
+        raise FileNotFoundError(f"Brain atlas not found: {atlas_path}")
+
+    vol = nib.load(str(atlas_path)).get_fdata()
+    # NIfTI is [H, W, D] → transpose to [D, H, W]
+    atlas = np.transpose(vol, (2, 0, 1)) > 0.5
+
+    if expected_shape is not None and atlas.shape != expected_shape:
+        raise ValueError(
+            f"Brain atlas shape {atlas.shape} does not match expected {expected_shape}"
+        )
+
+    return atlas
+
+
+def is_seg_inside_atlas(
+    seg: torch.Tensor | np.ndarray,
+    atlas: np.ndarray,
+    tolerance: float = 0.0,
+    dilate_pixels: int = 0,
+) -> bool:
+    """Check if segmentation mask is inside a pre-computed brain atlas.
+
+    Like ``is_seg_inside_brain()`` but uses a pre-computed atlas instead
+    of deriving the brain mask from an MRI image at runtime.
+
+    Args:
+        seg: Segmentation mask (any shape with optional batch/channel dims).
+        atlas: Pre-computed brain atlas as bool array [D, H, W].
+        tolerance: Maximum allowed ratio of outside voxels (0-1).
+        dilate_pixels: Extra dilation applied to atlas at runtime.
+
+    Returns:
+        True if segmentation is valid (inside atlas).
+    """
+    if isinstance(seg, torch.Tensor):
+        seg = seg.detach().cpu().numpy()
+    seg = np.squeeze(seg)
+
+    brain_mask = atlas
+    if dilate_pixels > 0:
+        brain_mask = ndimage.binary_dilation(brain_mask, iterations=dilate_pixels)
+
+    tumor_mask = seg > 0.5
+    n_tumor = int(tumor_mask.sum())
+    if n_tumor == 0:
+        return True
+
+    n_outside = int((tumor_mask & ~brain_mask).sum())
+    return (n_outside / n_tumor) <= tolerance
+
+
+def has_single_brain_component(
+    image: torch.Tensor | np.ndarray,
+    threshold: float = 0.05,
+    min_component_ratio: float = 0.01,
+) -> bool:
+    """Check that a generated volume has only one significant brain component.
+
+    Rejects volumes where the model generated disconnected blobs of tissue
+    (e.g., a separate island with a tumor not connected to the main brain).
+
+    Args:
+        image: MRI image (any shape, batch/channel dims squeezed).
+        threshold: Intensity threshold for tissue detection.
+        min_component_ratio: Minimum size relative to largest component
+            to count as "significant" (default 1% of brain size).
+
+    Returns:
+        True if only one significant component exists.
+    """
+    if isinstance(image, torch.Tensor):
+        image = image.detach().cpu().numpy()
+    image = np.squeeze(image)
+
+    binary = image > threshold
+    labeled, n_components = ndimage.label(binary)
+
+    if n_components <= 1:
+        return True
+
+    component_sizes = ndimage.sum(binary, labeled, range(1, n_components + 1))
+    largest = max(component_sizes)
+
+    # Count components that are significant (not just noise)
+    n_significant = sum(1 for s in component_sizes if s >= largest * min_component_ratio)
+
+    return n_significant <= 1
+
+
+class BrainPCAModel:
+    """PCA shape model for brain mask validation.
+
+    Loaded once, then used to validate many generated volumes.
+    """
+
+    def __init__(self, npz_path: str | Path):
+        data = np.load(npz_path)
+        self.mean = data['mean']  # [n_voxels]
+        self.components = data['components']  # [n_components, n_voxels]
+        self.error_threshold = (
+            float(data['error_threshold'][0])
+            if 'error_threshold' in data.files
+            else None
+        )
+        self.pca_shape = tuple(data['pca_shape'])  # (D, H, W) for downsampled
+        self.n_samples = int(data['n_samples'][0])
+        self.full_shape = (
+            tuple(int(value) for value in data['full_shape'])
+            if 'full_shape' in data.files
+            else None
+        )
+        self.support_threshold = (
+            float(data['support_threshold'][0])
+            if 'support_threshold' in data.files
+            else 0.5
+        )
+
+    def reconstruction_error(self, brain_mask: np.ndarray) -> float:
+        """Compute PCA reconstruction error for a brain mask.
+
+        Args:
+            brain_mask: Binary brain mask [D, H, W] at full resolution.
+
+        Returns:
+            Mean squared reconstruction error.
+        """
+        mask_down = self._downsample(brain_mask)
+        flat = mask_down.flatten().astype(np.float32)
+
+        centered = flat - self.mean
+        projection = centered @ self.components.T
+        reconstructed = projection @ self.components + self.mean
+
+        return float(np.mean((flat - reconstructed) ** 2))
+
+    def is_valid(self, brain_mask: np.ndarray) -> tuple[bool, float]:
+        """Check if brain mask has a real-brain-like shape.
+
+        Args:
+            brain_mask: Binary brain mask [D, H, W].
+
+        Returns:
+            Tuple of (is_valid, reconstruction_error).
+        """
+        if self.error_threshold is None:
+            raise ValueError(
+                "This PCA artifact does not define a reconstruction-error threshold"
+            )
+        error = self.reconstruction_error(brain_mask)
+        return error <= self.error_threshold, error
+
+    def reconstruct_support(self, brain_mask: np.ndarray) -> np.ndarray:
+        """Reconstruct a binary brain support at the input-mask resolution.
+
+        The continuous PCA reconstruction is interpolated to the generation
+        grid before applying the fixed 0.5 nearest-binary threshold.
+        """
+        brain_mask = np.squeeze(np.asarray(brain_mask))
+        if brain_mask.ndim != 3:
+            raise ValueError("PCA brain-support reconstruction requires a 3D mask")
+        if self.full_shape is not None and brain_mask.shape != self.full_shape:
+            raise ValueError(
+                f"Brain mask shape {brain_mask.shape} does not match PCA full shape "
+                f"{self.full_shape}"
+            )
+        if not 0.0 < self.support_threshold < 1.0:
+            raise ValueError("PCA support threshold must be between 0 and 1")
+
+        mask_down = self._downsample(brain_mask)
+        flat = mask_down.flatten().astype(np.float32)
+        centered = flat - self.mean
+        projection = centered @ self.components.T
+        reconstructed = (
+            projection @ self.components + self.mean
+        ).reshape(self.pca_shape)
+
+        reconstructed_tensor = torch.from_numpy(
+            reconstructed.astype(np.float32, copy=False)
+        ).unsqueeze(0).unsqueeze(0)
+        reconstructed_full = torch.nn.functional.interpolate(
+            reconstructed_tensor,
+            size=brain_mask.shape,
+            mode='trilinear',
+            align_corners=False,
+        ).squeeze().numpy()
+        return reconstructed_full > self.support_threshold
+
+    def _downsample(self, mask: np.ndarray) -> np.ndarray:
+        """Downsample mask to PCA resolution."""
+        mask_tensor = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0).unsqueeze(0)
+        down = torch.nn.functional.interpolate(
+            mask_tensor, size=self.pca_shape, mode='trilinear', align_corners=False,
+        )
+        return (down.squeeze().numpy() > 0.5).astype(np.float32)
+
+
+def is_brain_inside_atlas(
+    brain_mask: np.ndarray,
+    atlas: np.ndarray,
+    tolerance: float = 0.05,
+) -> bool:
+    """Check if a generated brain fits within the atlas (real data bounds).
+
+    Computes what fraction of the generated brain's voxels fall outside
+    the atlas. If more than ``tolerance`` fraction is outside, returns False.
+
+    Args:
+        brain_mask: Binary brain mask from generated volume [D, H, W].
+        atlas: Pre-computed brain atlas from real data [D, H, W].
+        tolerance: Maximum allowed fraction of brain voxels outside atlas (0-1).
+
+    Returns:
+        True if the generated brain is within atlas bounds.
+    """
+    n_brain = int(brain_mask.sum())
+    if n_brain == 0:
+        return False  # Empty brain is invalid
+
+    n_outside = int((brain_mask & ~atlas).sum())
+    outside_ratio = n_outside / n_brain
+
+    return outside_ratio <= tolerance
+
+
+def remove_tumors_outside_brain(
+    seg: np.ndarray,
+    brain_mask: np.ndarray,
+    outside_threshold: float = 0.1,
+) -> tuple[np.ndarray, int]:
+    """Remove individual tumors that fall outside the brain mask.
+
+    Labels connected components in seg, then removes any component where
+    more than ``outside_threshold`` of its voxels are outside the brain mask.
+
+    Args:
+        seg: Binary segmentation mask [D, H, W] (or [H, W] for 2D).
+        brain_mask: Binary brain mask, same spatial shape as seg.
+        outside_threshold: Fraction of voxels outside brain to trigger removal
+            (default 0.1 = remove if >10% outside).
+
+    Returns:
+        Tuple of (cleaned_seg, n_removed) where cleaned_seg is the
+        segmentation with outside tumors zeroed out.
+    """
+    seg_binary = (seg > 0.5).astype(np.uint8)
+    brain_binary = brain_mask.astype(bool)
+
+    labeled, n_components = ndimage.label(seg_binary)
+    if n_components == 0:
+        return seg_binary.astype(np.float32), 0
+
+    n_removed = 0
+    for label_id in range(1, n_components + 1):
+        component = labeled == label_id
+        n_voxels = int(component.sum())
+        n_outside = int((component & ~brain_binary).sum())
+
+        if n_voxels > 0 and (n_outside / n_voxels) > outside_threshold:
+            seg_binary[component] = 0
+            n_removed += 1
+
+    return seg_binary.astype(np.float32), n_removed

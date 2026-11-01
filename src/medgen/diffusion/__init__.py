@@ -1,0 +1,118 @@
+"""
+Diffusion model training components.
+
+This package provides:
+- Strategies: DDPM and Rectified Flow diffusion algorithms
+- Modes: Training modes for different conditioning setups
+- Spaces: Pixel and latent space abstractions for diffusion
+- Loading: Utilities for loading trained models from checkpoints
+
+Usage:
+    from medgen.diffusion import (
+        # Strategies
+        DiffusionStrategy, DDPMStrategy, RFlowStrategy,
+        # Modes
+        TrainingMode, SegmentationMode, ConditionalSingleMode,
+        ConditionalDualMode, MultiModalityMode, SegmentationConditionedMode,
+        # Spaces
+        DiffusionSpace, PixelSpace, LatentSpace, load_vae_for_latent_space,
+        # Loading
+        load_diffusion_model, load_diffusion_model_with_metadata,
+        detect_wrapper_type, LoadedModel,
+    )
+"""
+
+# Strategies
+from .strategies import (
+    DiffusionStrategy,
+    DDPMStrategy,
+    RFlowStrategy,
+    ParsedModelInput,
+)
+from .strategy_bridge import BridgeStrategy
+from .strategy_irsde import IRSDEStrategy
+from .strategy_resfusion import ResfusionStrategy
+
+# Conditioning
+from .conditioning import ConditioningContext
+
+# Modes
+from .modes import (
+    TrainingMode,
+    SegmentationMode,
+    ConditionalSingleMode,
+    ConditionalDualMode,
+    MultiModalityMode,
+    SegmentationConditionedMode,
+    SegmentationConditionedInputMode,
+    LatentSegConditionedMode,
+)
+
+# Spaces
+from .spaces import (
+    DiffusionSpace,
+    PixelSpace,
+    SpaceToDepthSpace,
+    WaveletSpace,
+    LatentSpace,
+    load_vae_for_latent_space,
+)
+
+# Loading utilities
+from .loading import (
+    load_diffusion_model,
+    load_diffusion_model_with_metadata,
+    detect_wrapper_type,
+    LoadedModel,
+)
+
+# Protocols (type-safe interfaces)
+from .protocols import (
+    DiffusionModel,
+    ConditionalDiffusionModel,
+    SizeBinModel,
+    PreparedBatch,
+    DiffusionSpaceProtocol,
+    TrainingModeProtocol,
+)
+
+__all__ = [
+    # Strategies
+    'DiffusionStrategy',
+    'DDPMStrategy',
+    'RFlowStrategy',
+    'BridgeStrategy',
+    'IRSDEStrategy',
+    'ResfusionStrategy',
+    'ParsedModelInput',
+    # Conditioning
+    'ConditioningContext',
+    # Modes
+    'TrainingMode',
+    'SegmentationMode',
+    'ConditionalSingleMode',
+    'ConditionalDualMode',
+    'MultiModalityMode',
+    'SegmentationConditionedMode',
+    'SegmentationConditionedInputMode',
+    'LatentSegConditionedMode',
+    # Spaces
+    'DiffusionSpace',
+    'PixelSpace',
+    'SpaceToDepthSpace',
+    'WaveletSpace',
+    'LatentSpace',
+    'load_vae_for_latent_space',
+    # Loading
+    'load_diffusion_model',
+    'load_diffusion_model_with_metadata',
+    'detect_wrapper_type',
+    'LoadedModel',
+    # Protocols
+    'DiffusionModel',
+    'ConditionalDiffusionModel',
+    'SizeBinModel',
+    'PreparedBatch',
+    'DiffusionSpaceProtocol',
+    'TrainingModeProtocol',
+]

@@ -1,0 +1,27 @@
+# Bravo Mode - Conditional single image generation
+#
+# Generates BRAVO MRI images conditioned on segmentation mask.
+# BRAVO = Brain Volume imaging with T1 weighting.
+#
+# For DIFFUSION training:
+#   in_channels: 2 = [noisy_bravo, seg_mask]
+#   out_channels: 1 = predicted bravo
+#   Dataloader: create_dataloader(image_type='bravo')
+#
+# For VAE training (channels overridden in train_vae.py):
+#   in_channels: 1 = bravo (NO seg mask!)
+#   out_channels: 1
+#   Dataloader: create_vae_dataloader()
+
+name: bravo
+is_conditional: true
+in_channels: 2   # [noisy_bravo, seg_mask] - for diffusion
+out_channels: 1  # predicted noise/velocity for bravo
+image_keys: [bravo]  # Which modalities to load
+description: "BRAVO image generation conditioned on segmentation mask"
+
+# Classifier-free guidance (CFG) dropout
+# - Disabled for bravo: dense seg mask conditioning doesn't benefit from CFG
+# - CFG amplifies weak conditioning (like text), but seg masks are already maximally informative
+# - Empirically: CFG dropout worsens CMMD without improving KID
+cfg_dropout_prob: 0.0  # Disabled - no benefit for dense spatial conditioning

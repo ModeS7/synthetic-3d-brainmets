@@ -1,0 +1,106 @@
+# Smoke test config — mirrors production defaults with minimal data
+#
+# PRINCIPLE: Test the REAL pipeline. Only reduce data size and epochs,
+# never disable features that run on the cluster. A smoke test that
+# skips features is useless — it won't catch bugs where they happen.
+#
+# Usage:
+#   pytest tests/integration/test_pipeline_smoke.py -m slow -v
+
+epochs: 2
+batch_size: 1
+learning_rate: 1.0e-4
+warmup_epochs: 0
+num_figures: 1
+augment: false
+
+# DataLoader - uses persistent workers to match cluster
+dataloader:
+  num_workers: 2
+  prefetch_factor: 2
+  pin_memory: true
+  persistent_workers: true
+
+# EMA enabled to test EMA init/update path
+use_ema: true
+ema:
+  decay: 0.999
+  update_after_step: 0
+  update_every: 1
+
+# Compile and precision — match cluster defaults
+use_compile: true
+compile_fused_forward: true
+use_fp32_loss: true
+gradient_checkpointing: false
+perceptual_weight: 0.0
+use_min_snr: false
+use_multi_gpu: false
+
+# Scheduler
+scheduler: cosine
+eta_min: 1.0e-6
+
+# Conditioning dropout — match cluster default (0.15)
+conditioning_dropout:
+  prob: 0.15
+
+# Training tricks disabled (these are opt-in on cluster too)
+score_aug:
+  enabled: false
+sda:
+  enabled: false
+gradient_noise:
+  enabled: false
+curriculum:
+  enabled: false
+timestep_jitter:
+  enabled: false
+self_conditioning:
+  enabled: false
+feature_perturbation:
+  enabled: false
+noise_augmentation:
+  enabled: false
+offset_noise:
+  enabled: false
+  adjusted: false
+augmented_diffusion:
+  enabled: false
+regional_weighting:
+  enabled: false
+sam:
+  enabled: false
+batch_augment:
+  enabled: false
+
+# Logging — ALL enabled, matching cluster defaults
+logging:
+  grad_norm: true
+  timestep_losses: true
+  regional_losses: true
+  timestep_region_losses: true
+  msssim: true
+  psnr: true
+  lpips: true
+  boundary_sharpness: true
+  intermediate_steps: true
+  worst_batch: true
+  flops: true
+
+# Generation metrics — enabled with minimal samples
+generation_metrics:
+  enabled: true
+  samples_per_epoch: 1
+  samples_extended: 1
+  steps_per_epoch: 5
+  steps_extended: 5
+  cache_dir: null
+  cfg_scale: 2.0
+
+# Profiling disabled (not a pipeline feature, just profiler tooling)
+profiling:
+  enabled: false
+
+# Verbose for test output
+verbose: false

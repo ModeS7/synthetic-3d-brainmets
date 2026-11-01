@@ -1,0 +1,461 @@
+# Default Training Configuration
+#
+# Common training hyperparameters used across all training scripts.
+# Override via CLI: python -m medgen.scripts.train training.epochs=1000
+
+# Resume training from a checkpoint (e.g., runs/.../checkpoint_latest.pt)
+# Each run still creates a new timestamped directory - state is loaded from old run
+resume_from: null
+
+# Experiment name prefix for run directory
+# Include trailing underscore: training.name=exp1_ -> exp1_rflow_128_...
+name: ""
+
+# Progress bar verbosity (tqdm)
+# false: Disable tqdm progress bars (cleaner SLURM logs)
+# true: Enable tqdm progress bars
+# Default true for local development, overridden to false in paths/cluster.yaml
+verbose: true
+
+# Core training parameters
+epochs: 500                # Total training epochs
+batch_size: 16             # Batch size per GPU
+gradient_accumulation_steps: 1  # Accumulate gradients over N micro-batches (effective_bs = batch_size * N)
+limit_train_batches: null  # Limit batches per epoch (null = use all, int = limit)
+learning_rate: 1.0e-4      # Base learning rate
+gradient_clip_norm: 1.0    # Max gradient norm (prevents explosions)
+warmup_epochs: 5           # Linear warmup epochs (0.1x -> 1x LR)
+num_figures: 20            # Total figure/extended-metric events during training
+collapse_window: 10        # Stop if MSE spikes >3x best and stays flat for this many epochs
+augment: false             # Data augmentation (disabled by default for diffusion)
+augment_type: diffusion    # Augmentation type: "diffusion" (conservative) or "vae" (aggressive)
+augmentation_level: basic  # 3D aug suite: 'basic' (flips+rot90), 'medium' (adds affine+intensity), 'mri' (adds bias field + noise)
+augmentation_t_schedule: null  # [t_on, t_full, t_off] ramp for in-trainer t-gated augmentation. null = dataloader-level (uniform, controlled by augment flag)
+augmentation_max_prob: 1.0     # Ceiling on per-step aug application probability; scales the schedule weight. <1 for matched-dose controls (uniform = schedule [0,0,1] + max_prob=p)
+augmentation_tada_schedule: null  # [r_rough, r_fine, delta] TADA parabola in log10(SNR) (Park 2023). Overrides augmentation_t_schedule when set. null = off
+rescale_data: false        # Rescale [0,1] data to [-1,1] for pixel-space diffusion (opt-in)
+
+# Batch-level augmentations (VAE only - mixup/cutmix/mosaic/copy-paste)
+batch_augment:
+  enabled: false           # Disabled by default, enabled in VAE configs
+  mixup_prob: 0.2          # Probability of mixup per batch
+  cutmix_prob: 0.2         # Probability of cutmix per batch
+  mosaic_prob: 0.2         # Probability of mosaic per batch
+  copy_paste_prob: 0.3     # Probability of copy-paste per batch
+
+# Score Augmentation - applies transforms to noisy data (after noise addition)
+# Reference: https://arxiv.org/abs/2508.07926
+# Unlike traditional augmentation (which augments clean data), ScoreAug transforms
+# the noisy input and target together, teaching equivariant denoising.
+#
+# Per paper: "one augmentation method is randomly selected with equal probability
+# across all types" - identity is always included, so with 4 transforms enabled,
+# each has 20% probability (1/5).
+#
+# Conditioning requirements:
+# - rotation/flip: REQUIRES omega conditioning (noise distribution is invariant)
+# - translation/cutout: Work without conditioning but risk data leakage
+# - brightness: Linear transform, works without conditioning
+scoreaug_t_schedule: null    # [t_on, t_full, t_off] ramp for t-gated ScoreAug. null = uniform (apply every step when score_aug.enabled=true)
+score_aug:
+  enabled: false             # Disabled by default
+  # Transforms - each enabled transform has equal probability
+  # Spatial transforms (D4 dihedral symmetries) - rotation and flip are combined:
+  #   - rotation only: 3 options (90°, 180°, 270°)
+  #   - flip only: 2 options (hflip, vflip)
+  #   - both: 7 options (3 rot + 2 flip + 2 rot+flip combos)
+  rotation: true             # 90, 180, 270 degree rotations (requires omega)
+  flip: true                 # Horizontal + vertical flip (requires omega)
+  translation: false         # +-40% X, +-20% Y translation with zero-pad
+  cutout: false              # Random rectangle cutout (10-30% each dimension)
+  brightness: false          # Brightness scaling (experimental with normalized data)
+  brightness_range: 1.2      # Max scale factor B, samples in [1/B, B]
+  use_omega_conditioning: true   # Always use omega conditioning when ScoreAug is enabled
+  # Compose mode: apply transforms independently instead of picking one
+  compose: false             # If true, each transform applied with compose_prob
+  compose_prob: 0.5          # Probability for each transform in compose mode
+
+  # Mode intensity scaling: multiply input by mode-specific scale factor
+  # Forces model to use mode conditioning to predict correct target
+  mode_intensity_scaling: false  # Requires use_omega_conditioning + mode.use_mode_embedding
+
+  # === v2 mode: structured non-destructive/destructive augmentation ===
+  # When enabled, separates transforms into:
+  # - Non-destructive (can stack): rotation, flip, translation
+  # - Destructive (pick one): cutout OR fixed patterns
+  #
+  # Works for both 2D and 3D:
+  # - 2D: Standard 2D transforms and patterns
+  # - 3D: 3D rotations around D/H/W axes, 3D flips, translation (±40% X, ±20% Y, 0% Z)
+  #       Patterns are 2D masks applied uniformly across depth ("2.5D patterns")
+  v2_mode: false             # Enable v2 structured augmentation
+  nondestructive_prob: 0.5   # Probability for each non-destructive transform
+  destructive_prob: 0.5      # Probability of applying any destructive transform
+  cutout_vs_pattern: 0.5     # Split between cutout (random) and patterns (fixed)
+
+  # Fixed pattern options (16 total patterns, 4 per category)
+  # Patterns are deterministic masks learned via one-hot embedding
+  # For 3D: patterns are 2D masks extended uniformly across depth dimension
+  patterns:
+    checkerboard: true       # 4×4 and 8×8 alternating grids (IDs 0-3)
+    grid_dropout: true       # Random 25%/50% grid cells dropped (IDs 4-7)
+    coarse_dropout: true     # 2-4 large holes at corners/edges (IDs 8-11)
+    patch_dropout: true      # MAE-style 25%/50% patches dropped (IDs 12-15)
+
+# ============================================================================
+# Shifted Data Augmentation (SDA)
+# ============================================================================
+# Reference: IEEE Access 2025 - "Regularization for Unconditional Image
+# Diffusion Models via Shifted Data Augmentation"
+#
+# Key difference from ScoreAug:
+# - ScoreAug: transforms NOISY data (after noise addition), requires omega
+# - SDA: transforms CLEAN data (before noise addition), uses noise shift
+#
+# SDA uses dual-path training:
+# 1. Standard path: x -> add_noise(t) -> denoise -> x
+# 2. Augmented path: T(x) -> add_noise(t + delta) -> denoise -> T(x)
+#
+# The shifted noise level prevents leakage by giving augmented samples
+# different SNR characteristics.
+#
+# Note: Do not use SDA and ScoreAug together (they do similar things differently)
+sda:
+  enabled: false             # Disabled by default
+  rotation: true             # 90, 180, 270 degree rotations
+  flip: true                 # Horizontal + vertical flip
+  noise_shift: 0.1           # Amount to shift timesteps (0.05-0.2 typical)
+  prob: 0.5                  # Probability of using augmented path
+  weight: 1.0                # Weight for augmented path loss
+
+# DataLoader optimization for CPU augmentation
+dataloader:
+  num_workers: 8           # Parallel data loading workers
+  prefetch_factor: 4       # Batches to prefetch per worker
+  pin_memory: true         # Faster CPU->GPU transfer
+  persistent_workers: true # Avoid worker respawn overhead
+
+# EMA (Exponential Moving Average)
+# Maintains slowly-updated weight copy for higher quality samples
+use_ema: false
+ema:
+  decay: 0.9999            # EMA decay rate (0.999-0.9999)
+  update_after_step: 100   # Start EMA after this many steps
+  update_every: 10         # Update EMA every N steps
+  mode: standard           # 'standard' (ema_pytorch.EMA) or 'post_hoc' (Karras EDM2 PostHocEMA)
+  # Post-hoc EMA settings (only used when mode=post_hoc)
+  # Reference: Karras et al., "Analyzing and Improving the Training Dynamics of Diffusion Models" (EDM2, CVPR 2024)
+  sigma_rels: [0.05, 0.28] # Power-function profiles (need ≥2 distinct values)
+  checkpoint_every_num_steps: 5000  # Snapshot interval for post-hoc synthesis
+
+# Min-SNR Loss Weighting (DDPM ONLY)
+# Reweights per-sample loss by timestep to prevent high-noise step domination.
+# Uses SNR = alpha_bar / (1 - alpha_bar) from DDPM's noise schedule.
+# NOTE: Has no theoretical basis for RFlow - will be auto-disabled with warning.
+# Reference: https://arxiv.org/abs/2303.09556
+use_min_snr: false
+min_snr_gamma: 5.0         # SNR clipping threshold
+
+# SAM (Sharpness-Aware Minimization)
+# Seeks flat minima for better generalization. Requires 2x compute per step.
+# Reference: https://arxiv.org/abs/2010.01412
+sam:
+  enabled: false             # Enable SAM optimizer
+  rho: 0.05                  # Perturbation radius (0.01-0.1 typical)
+  adaptive: false            # Use ASAM (adaptive, weight-scale invariant)
+
+# DC-AE 1.5: Augmented Diffusion Training
+# Applies channel masking to latent diffusion training to accelerate convergence.
+# MUST be used together with structured latent space autoencoder (dcae.structured_latent.enabled=true).
+# Using one without the other can hurt results (per paper ablation).
+#
+# Reference: "DC-AE 1.5: Accelerating Diffusion Model Convergence with Structured Latent Space"
+# https://arxiv.org/abs/2508.00413
+#
+# Algorithm (Eq. 2):
+#   1. Sample random channel count c' from [min_channels, ..., latent_channels]
+#   2. Create mask: [1,...,1 (c' times), 0,...,0]
+#   3. Apply mask to noisy latent AND noise target
+#   4. Compute loss only on masked channels
+#
+# Results: 6x faster convergence on UViT-H, DiT-XL gFID 26.44 -> 17.31
+#
+# Usage:
+#   python -m medgen.scripts.train mode=bravo strategy=rflow \
+#       vae_checkpoint=path/to/dcae_1_5.pt \
+#       training.augmented_diffusion.enabled=true
+augmented_diffusion:
+  enabled: false             # Enable augmented diffusion training
+  # Channel steps: [min_channels, min+step, ..., latent_channels]
+  # Should match the structured latent space config used for autoencoder training
+  min_channels: 16           # Minimum channels to keep (paper uses 16)
+  channel_step: 4            # Step size between options (paper uses 4)
+  # Only applies to latent diffusion (scale_factor > 1)
+  # Has no effect on pixel-space diffusion
+
+# Perceptual loss (SqueezeNet features)
+# Disabled by default for diffusion - adds compute overhead with minimal benefit
+perceptual_weight: 0.0     # Weight for perceptual loss term (0 = disabled)
+perceptual_network_type: radimagenet_resnet50  # Perceptual backbone. 2D/2.5D: radimagenet_resnet50, vgg, alex. TRUE-3D whole-volume: medicalnet_resnet10_23datasets (or _resnet50_)
+perceptual_compile: null   # torch.compile the perceptual loss. null = heuristic (compile 2D, skip true-3D); true/false to override (for benchmarking)
+perceptual_25d: false      # For 3D: apply the 2D perceptual over ALL depth slices (2.5D) instead of just the center slice. Finer but slower. Ignored for true-3D backbones.
+perceptual_max_timestep: null  # Legacy low-t ramp: only apply when t < this (null = all timesteps)
+perceptual_t_schedule: null    # High-t schedule [t_on, t_full, t_off]: piecewise-linear
+                                # weight=0 below t_on, ramps to 1 at t_full, plateaus, drops to 0 at t_off.
+                                # Accepts normalized [0,1] or integer [0,T]. Takes precedence over max_timestep.
+
+# Focal Frequency Loss (Jiang et al., ICCV 2021)
+# Adaptively upweights hard-to-synthesize frequency components for sharper texture
+# Applied to predicted clean image vs target in frequency domain (2D FFT per slice)
+focal_frequency_weight: 0.0  # Weight for FFL term (0 = disabled). Try 1.0.
+focal_frequency_t_schedule: null  # Same [t_on, t_full, t_off] semantics as perceptual_t_schedule
+
+# MSE (base loss) t-schedule gating — zeros or ramps the base diffusion loss by t.
+# Motivated by the MSE posterior-mean collapse at low t: auxiliary losses (perceptual,
+# FFL) are more useful than MSE for HF detail, and MSE's gradient fights them when both
+# are active at low t. Setting mse_t_schedule=[t_on, t_full, t_off] ramps MSE weight
+# 0 → 1 as t goes from t_on → t_full, plateau to 1, then 1 → 0 from t_off onward.
+# null = weight=1 at all t (current behavior).
+# Normalized [0,1] or integer [0,T]. Uses the same _compute_t_schedule_weight() helper
+# as perceptual/FFL, applied AFTER all base-loss paths (plain MSE, min-SNR, RFlow-SNR,
+# pseudo-huber, lpips-huber, regional-weighted).
+mse_t_schedule: null
+mse_t_schedule_min: 0.0      # Floor for the MSE weight (set >0 for soft-zero anchor).
+
+# PatchGAN adversarial fine-tuning (optional, used for exp40).
+# When enabled, adds a 2D/2.5D PatchDiscriminator and alternating G/D training
+# steps to the main diffusion loop. Adversarial supervision penalizes blurry
+# outputs directly — something MSE/LPIPS/FFL only approximate.
+#
+# The discriminator sees the center-slice of `predicted_clean` (for 3D, via
+# self._extract_center_slice) alongside the matching real slice. Generator
+# adversarial loss is added to total_loss with an optional t-schedule gate
+# (recommended: low-t only, where blur lives).
+#
+# WARNING: GAN training is unstable. Use small adv_weight (0.01-0.05), warm
+# up D alone for N steps, and ramp adv_weight from 0 to avoid shocking the
+# generator. Monitor D_loss: if it crashes <0.1, pause D updates.
+discriminator:
+  enabled: false             # Master switch (keep false for non-GAN training)
+  spatial_dims: 2            # 2 = 2.5D on center slice (recommended), 3 = full 3D
+  channels: 1                # PatchDiscriminator input channels (1 for grayscale BRAVO)
+  num_layers: 3              # Number of conv layers in the discriminator
+  num_channels: 32           # Base channel count (small to avoid memorization)
+  learning_rate: 1.0e-4
+  warmup_epochs: 1           # D-scheduler warmup (used by create_warmup_cosine_scheduler)
+  warmup_steps: 500          # Steps of D-alone training before coupling G to adv loss
+  step_frequency: 2          # Run D step every N G steps (G:D ratio = step_frequency:1)
+  adv_weight: 0.02           # Scalar for generator adversarial loss term
+  adv_weight_ramp_steps: 2000  # Ramp adv_weight 0 → full over this many G steps post-warmup
+  adv_t_schedule: null       # [t_on, t_full, t_off] to gate adv loss by t. e.g. [0.0, 0.02, 0.15]
+                              # for low-t-only adversarial. null = all t.
+
+# Multi-GPU (DDP)
+use_multi_gpu: false
+disable_ddp_optimizer: false  # Disable DDP optimizer for large models (saves memory)
+
+# Conditioning dropout for classifier-free guidance (CFG) training
+# Randomly drops conditioning to enable unconditional generation at inference
+# Only applies to conditional diffusion modes (bravo, dual, seg_conditioned)
+conditioning_dropout:
+  prob: 0.15               # Probability of dropping conditioning (0 = disabled)
+
+# Learning rate scheduler
+scheduler: cosine            # Options: "cosine" (default), "constant", "plateau"
+                             # cosine: warmup + cosine annealing to eta_min
+                             # constant: warmup then constant LR (may help with overfitting)
+                             # plateau: ReduceLROnPlateau - reduces LR when val loss plateaus
+eta_min: 1.0e-6              # Minimum LR for cosine annealing (only used if scheduler=cosine)
+
+# ReduceLROnPlateau settings (only used if scheduler=plateau)
+plateau:
+  factor: 0.5                # Factor to reduce LR by (new_lr = old_lr * factor)
+  patience: 10               # Epochs to wait before reducing LR
+  min_lr: 1.0e-6             # Minimum learning rate
+
+# Gradient Noise Injection
+# Adds Gaussian noise to gradients for implicit regularization
+# Reference: "Adding Gradient Noise Improves Learning" (Neelakantan et al., 2015)
+# Noise decays as: sigma / (1 + step)^decay
+gradient_noise:
+  enabled: false             # Enable gradient noise injection
+  sigma: 0.01                # Initial noise std (0.01-0.1 typical)
+  decay: 0.55                # Noise decay exponent (paper uses 0.55)
+
+# Curriculum Timestep Scheduling
+# Progressively shifts from easy (low noise) to hard (high noise) timesteps
+# Start training on easy samples, gradually introduce harder ones
+curriculum:
+  enabled: false             # Enable curriculum learning
+  warmup_epochs: 50          # Epochs to reach full timestep range
+  min_t_start: 0.0           # Initial minimum timestep (0.0 = start of range)
+  max_t_start: 0.3           # Initial maximum timestep (0.3 = low noise only)
+  min_t_end: 0.0             # Final minimum timestep
+  max_t_end: 1.0             # Final maximum timestep (1.0 = full range)
+
+# ============================================================================
+# "Clean" Regularization Techniques
+# ============================================================================
+# These provide regularization benefits WITHOUT leaking augmentation patterns
+# into generated samples (unlike standard data augmentation).
+
+# Timestep Jitter - adds small noise to sampled timesteps
+# Increases noise-level diversity without changing output distribution
+timestep_jitter:
+  enabled: false             # Enable timestep jitter
+  std: 0.05                  # Std of Gaussian noise added to timesteps (in [0,1] range)
+
+# Self-Conditioning via Consistency
+# Runs model twice: first pass (no grad), second pass uses first prediction for consistency
+# Adds consistency loss to encourage stable predictions
+# This variant works without model architecture changes
+self_conditioning:
+  enabled: false             # Enable self-conditioning
+  prob: 0.5                  # Probability of using self-conditioning per batch
+  consistency_weight: 0.1    # Weight for consistency loss term
+
+# Feature Perturbation - adds Gaussian noise to intermediate features
+# Like continuous dropout, regularizes without augmentation leakage
+feature_perturbation:
+  enabled: false             # Enable feature perturbation
+  std: 0.1                   # Std of noise added to features
+  layers: ["mid"]            # Which layers to perturb: "encoder", "mid", "decoder", or list
+
+# Input Noise Augmentation - perturbs the noise vector before adding to image
+# Increases noise diversity without changing what model learns to output
+noise_augmentation:
+  enabled: false             # Enable noise augmentation
+  std: 0.1                   # Std of perturbation added to noise vector
+
+# Offset Noise - adds spatially-constant (low-frequency) noise component
+# Addresses high-dimensional Gaussian mean concentration: randn() has near-zero
+# spatial mean, preventing generation of volumes with shifted global intensity.
+# noise = randn_like(x) + strength * randn(B, C, 1, ..., 1)
+offset_noise:
+  enabled: false             # Enable offset noise
+  strength: 0.1              # Strength of low-frequency offset (typical: 0.05-0.1)
+  adjusted: false            # Adjusted offset noise (Kutsuna 2024): also offset generation start noise
+
+# Diffusion Mixup - interpolates pairs of training samples before adding noise
+# Creates genuinely unseen training data to prevent memorization on small datasets
+# z_mix = λ·z_a + (1-λ)·z_b, seg_mix = λ·seg_a + (1-λ)·seg_b, λ ~ Beta(α, α)
+# With batch_size=1 (3D), buffers previous sample for cross-batch mixing
+diffusion_mixup:
+  enabled: false             # Enable diffusion mixup
+  alpha: 0.2                 # Beta distribution parameter (0.2 = mostly near-real, mild mixing)
+  prob: 0.5                  # Probability of applying mixup per step (0.5 = half steps are real)
+  warmup_epochs: 0           # Linear warmup: prob ramps from 0 to target over this many epochs
+
+# Optimizer settings
+optimizer:
+  betas: [0.9, 0.999]        # AdamW momentum parameters (beta1, beta2)
+                             # Default: [0.9, 0.999]
+                             # Phase 3 GAN refinement: [0.5, 0.9] (per DC-AE paper)
+  weight_decay: 0.0          # L2 regularization weight (default: 0.0)
+                             # Typical values: 0.01, 0.05, 0.1
+
+# torch.compile optimization
+# Compiles model and loss functions for faster training
+use_compile: true            # Compile VAE/discriminator/perceptual loss
+compile_fused_forward: true  # Compile fused forward pass (diffusion only, ~10% speedup)
+                             # Auto-disabled for latent space or Min-SNR
+
+# Cast to FP32 before loss computation (diffusion only)
+# Prevents subtle MSE accuracy issues with BF16/FP16 autocast
+use_fp32_loss: true
+
+# Gradient checkpointing (trades compute for memory)
+# Recomputes activations during backward pass instead of storing them
+# Default: false for 2D, overridden to true in 3D configs
+# INCOMPATIBLE with use_compile (validated at startup)
+gradient_checkpointing: false
+
+# Precision settings (VAE only)
+# Pure BF16 training stores model weights in BF16 for memory savings
+# Autocast continues to work as usual - this only affects weight storage
+precision:
+  dtype: bf16                # bf16, fp16, fp32 - model weight dtype when pure_weights=true
+  pure_weights: false        # If true, model weights stored in low precision (saves ~50% memory)
+
+# Memory profiling (detailed VRAM logging at key training points)
+# Useful for debugging OOM issues. Logs VRAM usage at:
+#   - Model setup, generation metrics init, before/after epochs
+#   - Only logs first 3 epochs to avoid spam
+memory_profiling: false
+
+# Logging and metrics (all logged every epoch, figures at figure_interval)
+# Mode compatibility:
+#   [seg] = segmentation only
+#   [cond] = bravo/dual only
+#   [all] = all modes
+logging:
+  # Training dynamics
+  grad_norm: true              # [all] Track gradient norm (catches instability)
+  timestep_losses: true        # [all] Loss by diffusion timestep
+  regional_losses: true        # [cond] Loss by tumor vs background region
+  timestep_region_losses: true # [cond] 2D heatmap: timestep x region
+
+  # Validation metrics
+  msssim: true                 # [cond] Multi-Scale Structural Similarity (2D/3D)
+  psnr: true                   # [cond] Peak signal-to-noise ratio
+  lpips: true                  # [cond] Learned Perceptual (2D only, slower)
+  boundary_sharpness: true     # [cond] Edge quality in tumor regions
+
+  # Visualization
+  intermediate_steps: true     # [cond] Save denoising trajectory
+  worst_batch: true            # [all] Save batch with highest loss each epoch
+  num_intermediate_steps: 5    # How many steps to visualize
+
+  # Performance
+  flops: true                  # [all] Measure model FLOPs (once at start)
+
+# PyTorch Profiler - exports Chrome traces for performance analysis
+# View traces: Perfetto UI (https://ui.perfetto.dev) or chrome://tracing
+# Reference: https://pytorch.org/tutorials/intermediate/tensorboard_profiler_tutorial.html
+profiling:
+  enabled: false              # Master switch
+  wait: 5                     # Steps to skip (torch.compile warmup)
+  warmup: 2                   # Steps to warm up profiler (discarded)
+  active: 10                  # Steps to actively profile
+  repeat: 1                   # Number of profiling cycles (0 = continuous)
+  record_shapes: true         # Record tensor shapes
+  profile_memory: true        # Track memory allocations
+  with_stack: false           # Include Python call stacks (slower)
+  with_flops: true            # Estimate FLOPs per operation
+
+# Generation Quality Metrics (Diffusion only)
+# Tracks KID, CMMD, FID to detect overfitting by comparing generated samples
+# against train/val distributions. Uses ResNet50 for KID/FID, BiomedCLIP for CMMD.
+# Reference features cached at training start for efficiency.
+generation_metrics:
+  enabled: true               # Enabled by default for overfitting detection
+  samples_per_epoch: 100      # Samples for quick metrics (every epoch)
+  samples_extended: 500       # Samples for extended metrics (every figure_interval)
+  samples_test: 1000          # Samples for final test evaluation
+  steps_per_epoch: 10         # Denoising steps for quick metrics
+  steps_extended: 25          # Denoising steps for extended metrics
+  steps_test: 50              # Denoising steps for test evaluation
+  cache_dir: ".cache/generation_features"  # Feature cache location
+  # feature_batch_size: null   # Defaults to training.batch_size for torch.compile consistency
+  cfg_scale: 2.0              # CFG scale for generation (requires CFG dropout during training)
+  cfg_mode: standard          # 'standard' or 'zero_star' (CFG-Zero*, Fan et al. 2025)
+
+# Region-Weighted Loss (Diffusion only - conditional modes)
+# Applies per-pixel loss weighting based on tumor size using RANO-BM thresholds.
+# Smaller tumors receive higher weights to improve reconstruction of clinically
+# important small lesions.
+#
+# Only applies to conditional modes (bravo, dual, multi) where segmentation
+# mask is available. Has no effect on unconditional (seg) training.
+#
+# Weight assignment by Feret diameter (longest edge-to-edge distance):
+#   tiny (<10mm): 2.5, small (10-20mm): 1.8, medium (20-30mm): 1.4, large (>=30mm): 1.2
+regional_weighting:
+  enabled: false              # Enable region-weighted loss
+  weights:
+    tiny: 2.5                 # <10mm Feret diameter
+    small: 1.8                # 10-20mm
+    medium: 1.4               # 20-30mm
+    large: 1.2                # >=30mm
+  background_weight: 1.0      # Weight for non-tumor pixels
+  fov_mm: 240.0               # Field of view in mm (for pixel->mm conversion)

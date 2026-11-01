@@ -1,0 +1,72 @@
+# Fast debug configuration for testing
+#
+# Minimal epochs and batch size for quick iteration.
+# Override default.yaml values for debugging.
+
+# Experiment name prefix
+name: ""
+
+# Core training parameters (reduced for fast testing)
+epochs: 6
+batch_size: 4
+limit_train_batches: 100  # Limit batches per epoch for quick tests
+learning_rate: 1.0e-4
+gradient_clip_norm: 1.0
+warmup_epochs: 1
+num_figures: 6  # Log figures every epoch for 6 epoch runs
+augment: false  # Disable augmentation for faster debug
+# Present so t-gated augmentation experiments resolve under `training=fast_debug`
+# (validate_before_submit.sh dry run) instead of erroring on a missing key.
+augmentation_level: basic
+augmentation_t_schedule: null
+augmentation_max_prob: 1.0
+augmentation_tada_schedule: null
+
+# Single-process data loading: fast and side-effect-free for validation dry runs
+# (no DataLoader worker subprocesses to leak).
+dataloader:
+  num_workers: 0
+
+# EMA settings
+use_ema: false
+ema:
+  decay: 0.9999
+  update_after_step: 100
+  update_every: 10
+
+# Min-SNR loss weighting
+use_min_snr: false
+min_snr_gamma: 5.0
+
+# Perceptual loss
+perceptual_weight: 0.001
+
+# Multi-GPU
+use_multi_gpu: false
+disable_ddp_optimizer: false
+
+# Learning rate scheduler
+eta_min: 1.0e-6
+
+# torch.compile (keep enabled to test same code paths as production)
+use_compile: true
+compile_fused_forward: false  # Only used in diffusion, not VAE
+
+# Regional weighting (disabled for debug)
+regional_weighting:
+  enabled: false
+
+# Logging (minimal for fast debug)
+logging:
+  grad_norm: true
+  timestep_losses: false
+  regional_losses: false
+  timestep_region_losses: false
+  msssim: false
+  psnr: false
+  lpips: false
+  boundary_sharpness: false
+  intermediate_steps: false
+  worst_batch: false
+  num_intermediate_steps: 3
+  flops: false

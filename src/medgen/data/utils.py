@@ -1,0 +1,360 @@
+"""
+Slice extraction, sequence merging, and NIfTI I/O utilities.
+
+This module provides functions for extracting 2D slices from 3D NIfTI volumes,
+merging multiple MR sequences from the same patients, and saving NIfTI files.
+"""
+from typing import TYPE_CHECKING
+
+import nibabel as nib
+import numpy as np
+import torch
+from monai.data import Dataset
+
+from medgen.augmentation import apply_augmentation
+from medgen.core.constants import BINARY_THRESHOLD_GT
+from medgen.data.dataset import NiFTIDataset
+
+if TYPE_CHECKING:
+    import albumentations as A
+
+try:
+    import albumentations as A
+except ImportError:
+    A = None  # type: ignore[assignment]
+
+
+def binarize_seg(data: torch.Tensor | np.ndarray, threshold: float = 0.5) -> torch.Tensor | np.ndarray:
+    """Clamp to [0,1] then threshold. Single source of truth for seg binarization.
+
+    Use this for generated/augmented data where values may be outside [0,1].
+    For ground truth data that's already valid, ``make_binary`` is sufficient.
+
+    Args:
+        data: Input tensor or array (any shape).
+        threshold: Binarization threshold (default 0.5).
+
+    Returns:
+        Binary mask with same type and shape as input.
+    """
+    if isinstance(data, torch.Tensor):
+        return (torch.clamp(data.float(), 0, 1) > threshold).float()
+    return np.where(np.clip(data, 0, 1) > threshold, 1.0, 0.0)
+
+
+def save_nifti(data: np.ndarray, output_path: str,
+               voxel_size: tuple[float, float, float] = (1.0, 1.0, 1.0)) -> None:
+    """Save numpy array as NIfTI file with correct voxel spacing.
+
+    Args:
+        data: 3D numpy array [H, W, D].
+        output_path: Path to save the NIfTI file.
+        voxel_size: Voxel dimensions in mm (x, y, z).
+    """
+    affine = np.diag([voxel_size[0], voxel_size[1], voxel_size[2], 1.0])
+    nifti = nib.Nifti1Image(data.astype(np.float32), affine)
+    nib.save(nifti, output_path)
+
+
+def make_binary(image: np.ndarray, threshold: float = BINARY_THRESHOLD_GT) -> np.ndarray:
+    """Convert image to binary mask using threshold.
+
+    Args:
+        image: Input image array.
+        threshold: Threshold value for binarization.
+
+    Returns:
+        Binary mask with values 0.0 or 1.0.
+    """
+    return np.where(image > threshold, 1.0, 0.0)
+
+
+def extract_slices_single(
+    nifti_dataset: Dataset,
+    augmentation: "A.Compose | None" = None
+) -> Dataset:
+    """Extract 2D slices from 3D volumes for single-sequence training.
+
+    Processes each 3D volume and extracts non-empty 2D slices along
+    the depth dimension.
+
+    Args:
+        nifti_dataset: Dataset of 3D volumes with shape [C, H, W, D].
+        augmentation: Optional albumentations Compose for data augmentation.
+
+    Returns:
+        Dataset of 2D slices with shape [C, H, W].
+    """
+    all_slices: list[np.ndarray] = []
+
+    for i in range(len(nifti_dataset)):
+        volume, _ = nifti_dataset[i]  # Shape: [1, H, W, D]
+
+        # Convert to numpy if tensor
+        if isinstance(volume, torch.Tensor):
+            volume = volume.numpy()
+
+        # Extract non-empty slices along depth dimension (axis 3)
+        # Threshold > 1.0: normalized intensities sum > 1.0 indicates
+        # meaningful tissue content, not just background noise
+        for k in range(volume.shape[3]):
+            slice_data = volume[:, :, :, k]
+            if np.sum(slice_data) > 1.0:
+                # Apply augmentation (no mask for single-channel)
+                slice_data = apply_augmentation(slice_data, augmentation, has_mask=False)
+                all_slices.append(slice_data)
+
+    return Dataset(all_slices)
+
+
+def extract_slices_dual(
+    merged_dataset: Dataset,
+    has_seg: bool = True,
+    augmentation: "A.Compose | None" = None
+) -> Dataset:
+    """Extract 2D slices from merged 3D volumes for multi-sequence training.
+
+    For dual mode, ensures ALL image channels have content (not black).
+    Optionally binarizes segmentation masks.
+
+    Args:
+        merged_dataset: Dataset with volumes of shape [C, H, W, D]
+            where C = 2 (bravo+seg) or C = 3 (pre+gd+seg).
+        has_seg: Whether last channel is segmentation mask to binarize.
+        augmentation: Optional albumentations Compose for data augmentation.
+
+    Returns:
+        Dataset of 2D slices with shape [C, H, W].
+    """
+    all_slices: list[np.ndarray] = []
+
+    for i in range(len(merged_dataset)):
+        volume = merged_dataset[i]  # Shape: [C, H, W, D]
+
+        # Convert to numpy if tensor
+        if hasattr(volume, 'numpy'):
+            volume = volume.numpy()
+
+        # Extract slices along depth dimension
+        for k in range(volume.shape[3]):
+            slice_data = volume[:, :, :, k]
+
+            if has_seg:
+                # Get image channels (all except last which is seg)
+                image_channels = slice_data[:-1, :, :]
+                num_image_channels = image_channels.shape[0]
+
+                # Check EACH image channel independently
+                all_images_have_content = True
+                for ch in range(num_image_channels):
+                    channel_sum = np.sum(image_channels[ch, :, :])
+                    if channel_sum <= 1.0:
+                        all_images_have_content = False
+                        break
+
+                # Only keep slice if ALL image channels have content
+                if all_images_have_content:
+                    slice_data_copy = slice_data.copy()
+                    # Apply augmentation (with mask at last channel)
+                    slice_data_copy = apply_augmentation(
+                        slice_data_copy, augmentation, has_mask=True, mask_channel=-1
+                    )
+                    # Binarize seg AFTER augmentation to avoid interpolation artifacts
+                    slice_data_copy[-1, :, :] = make_binary(
+                        slice_data_copy[-1, :, :], threshold=BINARY_THRESHOLD_GT
+                    )
+                    all_slices.append(slice_data_copy)
+            else:
+                # No seg mask, keep all non-empty slices
+                if np.sum(slice_data) > 1.0:
+                    slice_data_copy = slice_data.copy()
+                    # Apply augmentation (no mask)
+                    slice_data_copy = apply_augmentation(
+                        slice_data_copy, augmentation, has_mask=False
+                    )
+                    all_slices.append(slice_data_copy)
+
+    return Dataset(all_slices)
+
+
+def extract_slices_single_with_seg(
+    image_dataset: Dataset,
+    seg_dataset: Dataset,
+    augmentation: "A.Compose | None" = None
+) -> Dataset:
+    """Extract 2D slices with paired segmentation masks for regional metrics.
+
+    Each slice is returned as a tuple (image, seg) where:
+    - image: [1, H, W] single-channel image
+    - seg: [1, H, W] binary segmentation mask
+
+    Args:
+        image_dataset: Dataset of 3D image volumes with shape [1, H, W, D].
+        seg_dataset: Dataset of 3D seg volumes with shape [1, H, W, D].
+        augmentation: Optional albumentations Compose for data augmentation.
+
+    Returns:
+        Dataset of tuples (image_slice, seg_slice).
+    """
+    all_slices: list[tuple] = []
+
+    if len(image_dataset) != len(seg_dataset):
+        raise ValueError(
+            f"Image dataset ({len(image_dataset)}) and seg dataset ({len(seg_dataset)}) "
+            "must have same number of patients"
+        )
+
+    for i in range(len(image_dataset)):
+        image_volume, image_name = image_dataset[i]  # Shape: [1, H, W, D]
+        seg_volume, seg_name = seg_dataset[i]  # Shape: [1, H, W, D]
+
+        # Convert to numpy if tensor
+        if isinstance(image_volume, torch.Tensor):
+            image_volume = image_volume.numpy()
+        if isinstance(seg_volume, torch.Tensor):
+            seg_volume = seg_volume.numpy()
+
+        # Verify same patient
+        if image_name != seg_name:
+            raise ValueError(f"Patient mismatch: {image_name} vs {seg_name}")
+
+        # Extract non-empty slices along depth dimension (axis 3)
+        for k in range(image_volume.shape[3]):
+            image_slice = image_volume[:, :, :, k]
+            seg_slice = seg_volume[:, :, :, k]
+
+            if np.sum(image_slice) > 1.0:
+                if augmentation is not None:
+                    # Stack for joint augmentation, then split
+                    combined = np.concatenate([image_slice, seg_slice], axis=0)
+                    combined = apply_augmentation(
+                        combined, augmentation, has_mask=True, mask_channel=-1
+                    )
+                    image_slice = combined[:1, :, :]
+                    seg_slice = combined[1:, :, :]
+
+                # Binarize seg
+                seg_slice = make_binary(seg_slice, threshold=BINARY_THRESHOLD_GT)
+                all_slices.append((image_slice, seg_slice))
+
+    return Dataset(all_slices)
+
+
+def merge_sequences(datasets_dict: dict[str, NiFTIDataset]) -> Dataset:
+    """Merge multiple MR sequences from same patients into single dataset.
+
+    Concatenates volumes from different sequences along channel dimension,
+    ensuring patient alignment across all sequences.
+
+    Args:
+        datasets_dict: Dictionary mapping sequence names to NiFTIDatasets.
+            Example: {'t1_pre': dataset1, 't1_gd': dataset2, 'seg': dataset3}
+
+    Returns:
+        Dataset with merged volumes, shape [C, H, W, D] where C = num sequences.
+
+    Raises:
+        ValueError: If datasets have different lengths or patient mismatch.
+    """
+    if not datasets_dict:
+        raise ValueError("datasets_dict is empty, cannot merge sequences")
+
+    sequence_keys = list(datasets_dict.keys())
+    num_patients = len(datasets_dict[sequence_keys[0]])
+
+    # Verify all datasets have same length
+    for key, dataset in datasets_dict.items():
+        if len(dataset) != num_patients:
+            raise ValueError(
+                f"Dataset {key} has {len(dataset)} patients, expected {num_patients}"
+            )
+
+    merged_data: list[np.ndarray] = []
+
+    for patient_idx in range(num_patients):
+        patient_volumes: list[np.ndarray] = []
+        patient_name: str | None = None
+
+        for seq_key in sequence_keys:
+            volume, name = datasets_dict[seq_key][patient_idx]
+            patient_volumes.append(volume)
+
+            # Verify all sequences are from same patient
+            if patient_name is None:
+                patient_name = name
+            elif name != patient_name:
+                raise ValueError(
+                    f"Patient name mismatch: {patient_name} vs {name} "
+                    f"for sequence {seq_key}"
+                )
+
+        # Concatenate along channel dimension (axis 0)
+        merged_volume = np.concatenate(patient_volumes, axis=0)
+        merged_data.append(merged_volume)
+
+    return Dataset(merged_data)
+
+
+class CFGDropoutDataset(torch.utils.data.Dataset):
+    """Wrapper dataset that applies CFG dropout to conditioning channel.
+
+    Randomly zeros out the last channel (conditioning/seg mask) with
+    probability `cfg_dropout_prob` to enable classifier-free guidance
+    at inference time.
+
+    Args:
+        dataset: Base dataset to wrap.
+        cfg_dropout_prob: Probability of zeroing conditioning (default: 0.15).
+        conditioning_channel: Channel index to dropout (-1 for last channel).
+    """
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        cfg_dropout_prob: float = 0.15,
+        conditioning_channel: int = -1,
+    ) -> None:
+        self.dataset = dataset
+        self.cfg_dropout_prob = cfg_dropout_prob
+        self.conditioning_channel = conditioning_channel
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, idx: int):
+        item = self.dataset[idx]
+
+        # Handle different return formats
+        if isinstance(item, dict):
+            # Dict format: {'image': tensor, 'seg': tensor, ...}
+            if 'seg' in item and self.cfg_dropout_prob > 0:
+                if torch.rand(1).item() < self.cfg_dropout_prob:
+                    item = item.copy()  # Don't modify original
+                    item['seg'] = torch.zeros_like(item['seg'])
+            return item
+
+        elif isinstance(item, (tuple, list)):
+            # Tuple format: (image, seg) or (tensor,)
+            if len(item) == 2 and self.cfg_dropout_prob > 0:
+                image, seg = item
+                if torch.rand(1).item() < self.cfg_dropout_prob:
+                    if isinstance(seg, torch.Tensor):
+                        seg = torch.zeros_like(seg)
+                    else:
+                        seg = np.zeros_like(seg)
+                return (image, seg)
+            return item
+
+        elif isinstance(item, (torch.Tensor, np.ndarray)):
+            # Single tensor with channels: [C, H, W] where last channel is conditioning
+            if self.cfg_dropout_prob > 0 and item.shape[0] > 1:
+                if torch.rand(1).item() < self.cfg_dropout_prob:
+                    if isinstance(item, torch.Tensor):
+                        item = item.clone()
+                        item[self.conditioning_channel] = 0
+                    else:
+                        item = item.copy()
+                        item[self.conditioning_channel] = 0
+            return item
+
+        return item

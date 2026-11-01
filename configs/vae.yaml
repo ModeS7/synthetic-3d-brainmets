@@ -1,0 +1,75 @@
+# VAE Training Configuration for Latent Diffusion Models
+#
+# Trains AutoencoderKL with GAN loss for use in latent space diffusion.
+# Architecture matches MONAI 2D implementation.
+#
+# Usage:
+#   # Default: dual mode (T1 pre + T1 post)
+#   python -m medgen.scripts.train_vae
+#
+#   # Single modality
+#   python -m medgen.scripts.train_vae mode=bravo
+#
+#   # Custom settings
+#   python -m medgen.scripts.train_vae vae.latent_channels=4 model.image_size=256
+#
+# Note: VAE training uses create_vae_dataloader() which returns images
+# WITHOUT segmentation masks. This is different from diffusion training.
+#
+# Channel counts (overridden in train_vae.py):
+#   - dual mode: 2 channels (t1_pre + t1_gd, NO seg)
+#   - other modes: 1 channel
+
+defaults:
+  - model: default
+  - mode: dual        # Can be seg, bravo, dual, t1_pre, or t1_gd
+  - vae: default      # VAE architecture
+  - training: default
+  - paths: local      # AFTER training so it can override verbose
+  - _self_
+
+# Pretrained checkpoint (for fine-tuning from progressive VAE)
+pretrained_checkpoint: null  # Path to checkpoint (.pt) to load weights from
+
+# Override training defaults for VAE
+training:
+  epochs: 100
+  batch_size: 16
+  learning_rate: 1.0e-4     # Generator learning rate (MONAI default)
+  gradient_clip_norm: 1.0
+  warmup_epochs: 5
+  # Validates every epoch, figures logged at figure_interval=10
+  use_ema: false
+  # VAE-specific augmentation (aggressive + batch-level)
+  augment_type: vae         # Aggressive augmentation (noise, blur, scale, elastic)
+  batch_augment:
+    enabled: true           # Enable mixup/cutmix
+    mixup_prob: 0.2         # 20% chance per batch
+    cutmix_prob: 0.2        # 20% chance per batch
+  ema:
+    decay: 0.999
+    update_after_step: 100
+    update_every: 10
+  use_multi_gpu: false
+  # Logging options for VAE
+  logging:
+    grad_norm: true           # Track gradient norms
+    timestep_losses: false    # N/A for VAE (no diffusion timesteps)
+    regional_losses: true     # Track L1 loss in tumor vs background regions
+    timestep_region_losses: false  # N/A for VAE (no diffusion timesteps)
+    msssim: true              # MS-SSIM metric (2D/3D)
+    psnr: true                # PSNR metric
+    lpips: true               # LPIPS (2D only, slower)
+    boundary_sharpness: false # N/A for VAE
+    intermediate_steps: false # N/A for VAE
+    flops: true               # Measure FLOPs
+
+# Hydra configuration
+# Output structure: runs/compression_2d/{mode}/{exp_name}{size}_{timestamp}
+# Use training.name to add experiment prefix: training.name=exp1_ -> exp1_128_...
+hydra:
+  run:
+    dir: ${paths.model_dir}/compression_2d/${mode.name}/${oc.select:training.name,""}${model.image_size}_${now:%Y%m%d-%H%M%S}
+  sweep:
+    dir: ${paths.model_dir}/compression_2d/multirun/${now:%Y%m%d-%H%M%S}
+    subdir: ${hydra.job.num}

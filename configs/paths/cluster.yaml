@@ -1,0 +1,18 @@
+# @package _global_
+# NTNU IDUN cluster paths
+# Note: @package _global_ allows this config to override training.verbose at root level
+
+paths:
+  name: cluster
+  data_dir: /cluster/work/${oc.env:USER}/MedicalDataSets/brainmetshare-3
+  model_dir: /cluster/work/${oc.env:USER}/synthetic-3d-brainmets/runs
+  log_dir: /cluster/work/${oc.env:USER}/synthetic-3d-brainmets/runs
+  cache_dir: /cluster/work/${oc.env:USER}/.cache/medgen
+  generated_dir: /cluster/work/${oc.env:USER}/MedicalDataSets/generated
+
+  # Dataset-specific parameters (BrainMetShare: 256x256 @ 0.94mm/pixel)
+  fov_mm: 240.0  # Field of view in mm
+
+# Disable tqdm progress bars on cluster (keeps .err files clean)
+training:
+  verbose: false

@@ -1,0 +1,21 @@
+# Segmentation Mode - Unconditional mask generation
+#
+# Generates segmentation masks unconditionally (no conditioning input).
+# These masks can then be used to condition image generation.
+#
+# For DIFFUSION training:
+#   in_channels: 1 = noisy_seg
+#   out_channels: 1 = predicted seg
+#   Dataloader: create_dataloader(image_type='seg')
+#
+# For VAE training (same channels):
+#   in_channels: 1 = seg
+#   out_channels: 1
+#   Dataloader: create_vae_dataloader()
+
+name: seg
+is_conditional: false
+in_channels: 1   # noisy_seg only (unconditional)
+out_channels: 1  # predicted noise/velocity for seg
+image_keys: [seg]  # Which modalities to load
+description: "Unconditional segmentation mask generation"

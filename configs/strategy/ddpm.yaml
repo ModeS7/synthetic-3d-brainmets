@@ -1,0 +1,25 @@
+# DDPM (Denoising Diffusion Probabilistic Models) Strategy
+#
+# Original diffusion method that predicts the noise added to images.
+# Uses Markov chain to gradually denoise from pure noise to clean image.
+#
+# Reference: https://arxiv.org/abs/2006.11239
+#
+# Training:
+#   1. Add noise to clean image: x_t = sqrt(alpha_t) * x_0 + sqrt(1-alpha_t) * noise
+#   2. Model predicts target: eps_pred = model(x_t, t)
+#   3. Loss: MSE(eps_pred, target)
+#
+# Prediction types:
+#   epsilon: Predict noise (standard DDPM). Target = noise, loss = MSE(pred, noise)
+#   sample:  Predict clean image x₀ (used by WDM). Target = x₀, loss = MSE(pred, x₀)
+#
+# Inference:
+#   1. Start with pure noise x_T ~ N(0, I)
+#   2. Iteratively denoise: x_{t-1} = f(x_t, model_pred, t)
+#   3. Returns clean image x_0
+
+name: ddpm
+num_train_timesteps: 1000    # Total diffusion steps
+schedule: cosine             # Noise schedule (linear, cosine, scaled_linear)
+prediction_type: epsilon     # epsilon=noise, sample=x₀ (clean image)

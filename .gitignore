@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.egg-info/
+outputs/
+runs/
+figures/output/
+*.nii.gz
+!data/brain_atlas_256x256x160.nii.gz
+*.pt
+*.pth
+build/

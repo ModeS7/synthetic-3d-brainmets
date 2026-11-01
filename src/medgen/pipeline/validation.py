@@ -1,0 +1,710 @@
+"""Validation utilities for diffusion training.
+
+This module provides validation loop functionality:
+- Main validation loss computation with regional tracking
+- Per-modality validation for multi-modality mode
+- Timestep bin loss tracking
+"""
+import gc
+import logging
+from typing import TYPE_CHECKING, Any
+
+import torch
+
+from medgen.metrics import (
+    RegionalMetricsTracker,
+    compute_dice,
+    compute_iou,
+    compute_msssim,
+    compute_perceptual_distance,
+    compute_perceptual_distance_3d,
+    compute_psnr,
+)
+
+if TYPE_CHECKING:
+    from medgen.pipeline.trainer import DiffusionTrainer
+
+logger = logging.getLogger(__name__)
+
+
+def compute_validation_losses(
+    trainer: 'DiffusionTrainer',
+    epoch: int,
+) -> tuple[dict[str, float], dict[str, Any] | None]:
+    """Compute losses and metrics on validation set.
+
+    Args:
+        trainer: The DiffusionTrainer instance.
+        epoch: Current epoch number (for TensorBoard logging).
+
+    Returns:
+        Tuple of (metrics dict, worst_batch_data or None).
+        Metrics dict contains: mse, perceptual, total, msssim, psnr.
+        Worst batch data contains: original, generated, mask, timesteps, loss.
+    """
+    if trainer.val_loader is None:
+        return {}, None
+
+    # Save random state - validation uses torch.randn_like() which would otherwise
+    # shift the global RNG and cause training to diverge across epochs
+    rng_state = torch.get_rng_state()
+    cuda_rng_state = torch.cuda.get_rng_state(trainer.device) if torch.cuda.is_available() else None
+
+    model_to_use = trainer.ema.ema_model if trainer.ema is not None else trainer.model_raw
+    model_to_use.eval()
+
+    total_mse = 0.0
+    total_perc = 0.0
+    total_loss = 0.0
+    total_msssim = 0.0
+    total_psnr = 0.0
+    total_lpips = 0.0
+    total_dice = 0.0
+    total_iou = 0.0
+    total_aux_bin = 0.0
+    n_batches = 0
+
+    # Check if seg mode (use Dice/IoU instead of perceptual metrics)
+    is_seg_mode = trainer.mode_name in ('seg', 'seg_conditioned')
+
+    # Per-channel metrics for dual/multi modes
+    per_channel_metrics: dict[str, dict[str, float]] = {}
+
+    # Track worst validation batch (only from full-sized batches)
+    worst_loss = 0.0
+    worst_batch_data: dict[str, Any] | None = None
+    min_batch_size = trainer.batch_size  # Don't track small last batches
+
+    # Regional tracking now uses unified metrics internal tracker
+    # (initialized with enable_regional=trainer.log_regional_losses)
+
+    # Initialize timestep loss tracking for validation
+    num_timestep_bins = 10
+    timestep_loss_sum = torch.zeros(num_timestep_bins, device=trainer.device)
+    timestep_loss_count = torch.zeros(num_timestep_bins, device=trainer.device, dtype=torch.long)
+
+    # For latent diffusion: use pixel_val_loader if available so we have original
+    # pixel images for quality metrics. Comparing decode(pred) vs decode(latent_gt)
+    # is misleading — shared decoder artifacts cancel out, giving fake-perfect metrics.
+    # Encoding on-the-fly in validation (no_grad, once per epoch) is negligible cost.
+    #
+    # bravo_seg_cond special case: uses dual encoders (bravo VQ-VAE + seg VQ-VAE).
+    # space.encode() only wraps the bravo VQ-VAE, so encoding pixel seg through it
+    # produces wrong latents. We use the latent val_loader for diffusion (correct
+    # seg conditioning) but iterate pixel_val_loader in parallel just for metrics_gt.
+    val_loader = trainer.val_loader
+    pixel_val_loader = getattr(trainer, 'pixel_val_loader', None)
+    use_pixel_loader = (
+        pixel_val_loader is not None
+        and trainer.mode_name != 'bravo_seg_cond'
+    )
+    if use_pixel_loader:
+        val_loader = pixel_val_loader
+
+    # For bravo_seg_cond: parallel pixel loader for honest quality metrics.
+    # Latent loader provides correct seg conditioning for diffusion computation,
+    # pixel loader provides original bravo images for metrics_gt.
+    pixel_metrics_iter: Any = None
+    if trainer.mode_name == 'bravo_seg_cond' and pixel_val_loader is not None:
+        pixel_metrics_iter = iter(pixel_val_loader)
+        logger.debug("bravo_seg_cond: using parallel pixel loader for quality metrics")
+
+    # Mark CUDA graph step boundary to prevent tensor caching issues
+    torch.compiler.cudagraph_mark_step_begin()
+
+    with torch.no_grad():
+        for batch in val_loader:
+            prepared = trainer.mode.prepare_batch(batch, trainer.device)
+            images = prepared['images']
+            labels = prepared.get('labels')
+            mode_id = prepared.get('mode_id')  # For multi-modality mode
+            size_bins = prepared.get('size_bins')  # For seg_conditioned mode
+            bin_maps = prepared.get('bin_maps')  # For seg_conditioned_input mode
+            is_latent = prepared.get('is_latent', False)
+            labels_is_latent = prepared.get('labels_is_latent', False)
+
+            # Get current batch size
+            if isinstance(images, dict):
+                first_key = list(images.keys())[0]
+                current_batch_size = images[first_key].shape[0]
+            else:
+                current_batch_size = images.shape[0]
+
+            # Keep pixel-space originals for quality metrics and regional tracking.
+            # When data is already latent (bravo_seg_cond), we don't have pixel originals
+            # from this loader — but we may have them from the parallel pixel loader.
+            images_pixel = images if not is_latent else None
+            labels_pixel = labels if not labels_is_latent else None
+
+            # bravo_seg_cond: grab pixel bravo images from parallel pixel loader
+            # for honest quality metrics (avoids shared decoder artifact cancellation).
+            if pixel_metrics_iter is not None and images_pixel is None:
+                try:
+                    pixel_batch = next(pixel_metrics_iter)
+                    pixel_images = pixel_batch['image'].to(trainer.device, non_blocking=True)
+                    # Verify batch sizes match (both loaders iterate same val split)
+                    if pixel_images.shape[0] == current_batch_size:
+                        images_pixel = pixel_images
+                except StopIteration:
+                    pixel_metrics_iter = None  # Exhausted, fall back to shared decoder
+
+            # Encode to diffusion space (skip if already latent from cache)
+            if not is_latent:
+                images = trainer.space.encode_batch(images)
+            if labels is not None and not labels_is_latent:
+                labels = trainer.space.encode(labels)
+
+            labels_dict = {'labels': labels, 'bin_maps': bin_maps}
+
+            # Sample timesteps and noise
+            if isinstance(images, dict):
+                noise = {key: torch.randn_like(img).to(trainer.device) for key, img in images.items()}
+            else:
+                noise = torch.randn_like(images).to(trainer.device)
+
+            timesteps = trainer.strategy.sample_timesteps(images)
+            noisy_images = trainer.strategy.add_noise(images, noise, timesteps)
+
+            # For ControlNet (Stage 1 or 2): use only noisy images (no concatenation)
+            if trainer.use_controlnet or trainer.controlnet_stage1:
+                model_input = noisy_images
+            else:
+                model_input = trainer.mode.format_model_input(noisy_images, labels_dict)
+
+            # Apply mode intensity scaling for validation consistency
+            if trainer.use_mode_intensity_scaling and mode_id is not None:
+                model_input, _ = trainer._apply_mode_intensity_scale(model_input, mode_id)
+
+            # Predict and compute loss
+            if trainer.use_mode_embedding and mode_id is not None:
+                prediction = model_to_use(model_input, timesteps, mode_id=mode_id)
+            elif trainer.use_size_bin_embedding:
+                prediction = model_to_use(model_input, timesteps, size_bins=size_bins)
+            else:
+                prediction = trainer.strategy.predict_noise_or_velocity(model_to_use, model_input, timesteps)
+            mse_loss, predicted_clean = trainer.strategy.compute_loss(prediction, images, noise, noisy_images, timesteps)
+
+            # Auxiliary bin prediction loss (validation)
+            bin_pred_head = getattr(trainer, '_bin_prediction_head', None)
+            if bin_pred_head is not None and size_bins is not None:
+                mask = size_bins.sum(dim=1) > 0  # [B] — True for conditioned samples
+                if mask.any():
+                    bin_pred = bin_pred_head.predict()
+                    if bin_pred is not None:
+                        target = size_bins[mask].float()
+                        pred = bin_pred[mask]
+                        total_aux_bin += torch.nn.functional.mse_loss(pred, target).item()
+                bin_pred_head.clear_cache()
+
+            # Compute perceptual loss
+            if trainer.perceptual_weight > 0:
+                if trainer.space.needs_decode:
+                    pred_decoded = trainer.space.decode_batch(predicted_clean)
+                    images_decoded = trainer.space.decode_batch(images)
+                else:
+                    pred_decoded = predicted_clean
+                    images_decoded = images
+                p_loss = trainer.perceptual_loss_fn(pred_decoded.float(), images_decoded.float())
+            else:
+                p_loss = torch.tensor(0.0, device=trainer.device)
+
+            loss = mse_loss + trainer.perceptual_weight * p_loss
+            loss_val = loss.item()
+
+            total_mse += mse_loss.item()
+            total_perc += p_loss.item()
+            total_loss += loss_val
+
+            # Track worst batch (only from full-sized batches)
+            if loss_val > worst_loss and current_batch_size >= min_batch_size:
+                worst_loss = loss_val
+                # Use pixel-space labels for mask overlay (not latent-space labels)
+                mask_for_viz = labels_pixel if labels_pixel is not None else labels
+                if isinstance(images, dict):
+                    worst_batch_data = {
+                        'original': {k: v.cpu() for k, v in images.items()},
+                        'generated': {k: v.cpu() for k, v in predicted_clean.items()},
+                        'mask': mask_for_viz.cpu() if mask_for_viz is not None else None,
+                        'timesteps': timesteps.cpu(),
+                        'loss': loss_val,
+                    }
+                else:
+                    worst_batch_data = {
+                        'original': images.cpu(),
+                        'generated': predicted_clean.cpu(),
+                        'mask': mask_for_viz.cpu() if mask_for_viz is not None else None,
+                        'timesteps': timesteps.cpu(),
+                        'loss': loss_val,
+                    }
+
+            # Quality metrics: decode prediction to pixel space, compare against originals.
+            # When pixel originals are available (pixel_val_loader or parallel pixel
+            # loader for bravo_seg_cond), use them directly.
+            # Fallback: decoded latent GT (shared decoder — metrics are relative only).
+            if trainer.space.needs_decode:
+                metrics_pred = trainer.space.decode_batch(predicted_clean)
+            else:
+                metrics_pred = predicted_clean
+            if images_pixel is not None:
+                metrics_gt = images_pixel
+            elif trainer.space.needs_decode:
+                metrics_gt = trainer.space.decode_batch(images)
+            else:
+                metrics_gt = images
+
+            if isinstance(metrics_pred, dict):
+                # Dual/multi mode: compute per-channel AND average metrics
+                keys = list(metrics_pred.keys())
+                channel_msssim = {}
+                channel_psnr = {}
+                channel_lpips = {}
+
+                for key in keys:
+                    channel_msssim[key] = compute_msssim(
+                        metrics_pred[key], metrics_gt[key], spatial_dims=trainer.spatial_dims
+                    )
+                    channel_psnr[key] = compute_psnr(metrics_pred[key], metrics_gt[key])
+                    if trainer.log_lpips:
+                        if trainer.spatial_dims == 3:
+                            channel_lpips[key] = compute_perceptual_distance_3d(
+                                metrics_pred[key], metrics_gt[key], trainer.device, use_compile=False
+                            )
+                        else:
+                            channel_lpips[key] = compute_perceptual_distance(metrics_pred[key], metrics_gt[key], trainer.device)
+
+                    # Accumulate per-channel metrics
+                    if key not in per_channel_metrics:
+                        per_channel_metrics[key] = {'msssim': 0.0, 'psnr': 0.0, 'lpips': 0.0, 'count': 0}
+                    per_channel_metrics[key]['msssim'] += channel_msssim[key]
+                    per_channel_metrics[key]['psnr'] += channel_psnr[key]
+                    if trainer.log_lpips:
+                        per_channel_metrics[key]['lpips'] += channel_lpips[key]
+                    per_channel_metrics[key]['count'] += 1
+
+                # Average across channels for combined metrics
+                msssim_val = sum(channel_msssim.values()) / len(keys)
+                psnr_val = sum(channel_psnr.values()) / len(keys)
+                lpips_val = sum(channel_lpips.values()) / len(keys) if trainer.log_lpips else 0.0
+            else:
+                # Use dimension-appropriate metric functions
+                msssim_val = compute_msssim(metrics_pred, metrics_gt, spatial_dims=trainer.spatial_dims)
+                psnr_val = compute_psnr(metrics_pred, metrics_gt)
+                if trainer.log_lpips:
+                    if trainer.spatial_dims == 3:
+                        # 3D: use center-slice LPIPS (2.5D approach)
+                        # Disable torch.compile for 3D to avoid CUDA Graph pools (~8 GiB)
+                        # that permanently fragment GPU memory and block generation metrics
+                        lpips_val = compute_perceptual_distance_3d(metrics_pred, metrics_gt, trainer.device, use_compile=False)
+                    else:
+                        lpips_val = compute_perceptual_distance(metrics_pred, metrics_gt, trainer.device)
+                else:
+                    lpips_val = 0.0
+
+            total_msssim += msssim_val
+            total_psnr += psnr_val
+            total_lpips += lpips_val
+
+            # Compute Dice/IoU for seg modes
+            # For diffusion output: predicted_clean is already in [0, 1] range (not logits)
+            if is_seg_mode:
+                dice_val = compute_dice(metrics_pred, metrics_gt, apply_sigmoid=False)
+                iou_val = compute_iou(metrics_pred, metrics_gt, apply_sigmoid=False)
+                total_dice += dice_val
+                total_iou += iou_val
+
+            n_batches += 1
+
+            # Regional tracking via unified metrics (tumor vs background)
+            # IMPORTANT: Use DECODED tensors (metrics_pred, metrics_gt) and PIXEL-SPACE labels
+            # This ensures regional quality metrics are computed in pixel space for consistency
+            # with pixel-space diffusion (same PSNR/MSE interpretation regardless of latent vs pixel)
+            if trainer.log_regional_losses and labels_pixel is not None:
+                # Regional tracker expects tensors — stack dict channels for dual/triple
+                if isinstance(metrics_pred, dict):
+                    reg_pred = torch.cat(list(metrics_pred.values()), dim=1)
+                    reg_gt = torch.cat(list(metrics_gt.values()), dim=1)
+                else:
+                    reg_pred = metrics_pred
+                    reg_gt = metrics_gt
+                trainer._unified_metrics.update_regional(reg_pred, reg_gt, labels_pixel)
+
+            # Timestep loss tracking (per-bin velocity/noise prediction MSE)
+            # Uses the actual training target (velocity for RFlow, noise for DDPM)
+            # Note: This is computed in TRAINING space (latent for latent diffusion)
+            # because we're measuring model prediction quality, not reconstruction quality
+            if trainer.log_timestep_losses:
+                # Compute target based on strategy (velocity for RFlow, noise for DDPM)
+                if isinstance(images, dict):
+                    keys = list(images.keys())
+                    if trainer.strategy_name == 'rflow':
+                        target = torch.cat([images[k] - noise[k] for k in keys], dim=1)
+                    else:
+                        target = torch.cat([noise[k] for k in keys], dim=1)
+                else:
+                    target = images - noise if trainer.strategy_name == 'rflow' else noise
+
+                # Mean over all non-batch dims: 2D [B,C,H,W] -> (1,2,3), 3D [B,C,D,H,W] -> (1,2,3,4)
+                mse_per_sample = ((prediction.float() - target.float()) ** 2).flatten(1).mean(1)
+                bin_size = trainer.num_timesteps // num_timestep_bins
+                bin_indices = (timesteps // bin_size).clamp(max=num_timestep_bins - 1).long()
+                timestep_loss_sum.scatter_add_(0, bin_indices, mse_per_sample)
+                timestep_loss_count.scatter_add_(0, bin_indices, torch.ones_like(bin_indices))
+
+                # Timestep-region tracking (for heatmap) - split by tumor/background
+                # For latent diffusion: compute error in PIXEL space for consistent interpretation
+                # Uses decoded predictions and pixel-space labels for masking
+                if trainer.log_timestep_region_losses and labels_pixel is not None:
+                    # Compute pixel-space error map for region tracking
+                    if trainer.space.needs_decode:
+                        # Latent diffusion: decode prediction and compute pixel-space target
+                        # For pixel-space region analysis, we compare decoded x0 prediction vs ground truth
+                        error_for_region = ((metrics_pred.float() - metrics_gt.float()) ** 2)
+                        region_labels = labels_pixel
+                    else:
+                        # Pixel space: use training-space error
+                        error_for_region = ((prediction.float() - target.float()) ** 2)
+                        region_labels = labels
+
+                    if trainer.spatial_dims == 3:
+                        # 3D: extract center slice for efficiency
+                        center_idx = error_for_region.shape[2] // 2
+                        error_map = error_for_region[:, :, center_idx, :, :].mean(dim=1)  # [B, H, W]
+                        mask = region_labels[:, 0, center_idx, :, :] > 0.5  # [B, H, W]
+                    else:
+                        # 2D: use full images
+                        error_map = error_for_region.mean(dim=1)  # [B, H, W]
+                        mask = region_labels[:, 0] > 0.5  # [B, H, W]
+
+                    for i in range(current_batch_size):
+                        t_norm = timesteps[i].item() / trainer.num_timesteps
+                        sample_error = error_map[i]  # [H, W]
+                        sample_mask = mask[i]  # [H, W]
+                        tumor_px = sample_mask.sum().item()
+                        bg_px = (~sample_mask).sum().item()
+                        tumor_loss = (sample_error * sample_mask.float()).sum().item() if tumor_px > 0 else 0.0
+                        bg_loss = (sample_error * (~sample_mask).float()).sum().item() if bg_px > 0 else 0.0
+                        trainer._unified_metrics.update_timestep_region_loss(
+                            t_norm, tumor_loss, bg_loss, int(tumor_px), int(bg_px)
+                        )
+
+
+    # Restore model state and RNG using try/finally for robustness
+    try:
+        model_to_use.train()
+
+        # Handle empty validation set
+        if n_batches == 0:
+            logger.warning("Validation set is empty, skipping metrics")
+            return {}, None
+
+        metrics = {
+            'mse': total_mse / n_batches,
+            'perceptual': total_perc / n_batches,
+            'total': total_loss / n_batches,
+            'msssim': total_msssim / n_batches,
+            'psnr': total_psnr / n_batches,
+        }
+        if trainer.log_lpips:
+            metrics['lpips'] = total_lpips / n_batches
+
+        # Add Dice/IoU for seg modes
+        if is_seg_mode:
+            metrics['dice'] = total_dice / n_batches
+            metrics['iou'] = total_iou / n_batches
+
+        # Log to TensorBoard using unified system
+        if trainer.writer is not None and trainer._unified_metrics is not None:
+            # Update unified metrics with validation values
+            trainer._unified_metrics.update_loss(trainer.strategy.loss_name, metrics['mse'], phase='val')
+            if trainer.perceptual_weight > 0:
+                trainer._unified_metrics.update_loss('Total', metrics['total'], phase='val')
+                trainer._unified_metrics.update_loss('Perceptual', metrics['perceptual'], phase='val')
+            if total_aux_bin > 0:
+                trainer._unified_metrics.update_loss('AuxBin', total_aux_bin / n_batches, phase='val')
+
+            # Compute 3D MS-SSIM first so we can include it in metrics
+            msssim_3d = None
+            if trainer.log_msssim:
+                try:
+                    msssim_3d = trainer._compute_volume_3d_msssim(epoch, data_split='val')
+                except Exception as e:
+                    logger.warning(f"Volume 3D MS-SSIM failed (skipping): {e}")
+                if msssim_3d is not None:
+                    metrics['msssim_3d'] = msssim_3d
+
+            # Update quality metrics using unified system
+            trainer._unified_metrics.update_validation_batch(
+                psnr=metrics['psnr'],
+                msssim=metrics['msssim'],
+                lpips=metrics.get('lpips'),
+                msssim_3d=msssim_3d,
+                dice=metrics.get('dice'),
+                iou=metrics.get('iou'),
+            )
+
+            # Log per-timestep validation losses using unified system
+            # NOTE: Must happen BEFORE log_validation() so timesteps are included
+            if trainer.log_timestep_losses:
+                counts = timestep_loss_count.cpu()
+                sums = timestep_loss_sum.cpu()
+                for i in range(num_timestep_bins):
+                    if counts[i] > 0:
+                        avg_loss = (sums[i] / counts[i]).item()
+                        t_normalized = (i + 0.5) / num_timestep_bins  # Center of bin
+                        trainer._unified_metrics.update_timestep_loss(t_normalized, avg_loss)
+
+            # Log validation metrics (now includes timesteps)
+            trainer._unified_metrics.log_validation(epoch)
+
+            # Log per-channel metrics for dual/multi modes (via unified metrics)
+            if per_channel_metrics:
+                trainer._unified_metrics.log_per_channel_validation(per_channel_metrics, epoch)
+
+            # Regional metrics are now logged via log_validation() using internal tracker
+
+            # Log timestep-region heatmap on figure epochs
+            if (epoch + 1) % trainer.figure_interval == 0 and trainer.log_timestep_region_losses:
+                trainer._unified_metrics.log_timestep_region_heatmap(epoch)
+
+            # Compute generation quality metrics (KID, CMMD)
+            if trainer._gen_metrics is not None:
+                # Defragment GPU memory before generation.
+                # After training, model/optimizer tensors are scattered across the GPU address space.
+                # The Conv3d im2col workspace at 256x256x160 needs ~18 GiB contiguous, which can't
+                # be allocated from fragmented free blocks. Fix: move everything to CPU, release all
+                # GPU segments, then move model back (fresh contiguous allocation).
+                # Unload feature extractors first (may still be loaded from cache_reference_features
+                # or a previous epoch) to maximize free memory for defrag.
+                trainer._gen_metrics.unload_extractors()
+                # Clear cached LPIPS/MS-SSIM metrics from validation loop to free GPU memory.
+                # These are held by @lru_cache and won't be freed by empty_cache alone.
+                from medgen.metrics.quality import clear_metric_caches
+                clear_metric_caches()
+                gen_model = trainer.ema.ema_model if trainer.ema is not None else trainer.model_raw
+
+                # 1. Move optimizer state to CPU.
+                # Set the flag ONLY after the move fully completes — otherwise the
+                # finally-block at the bottom tries to restore state that was never
+                # moved and may leave the optimizer in a mixed-device state.
+                optimizer_offloaded = False
+                if hasattr(trainer, 'optimizer') and trainer.optimizer is not None:
+                    try:
+                        for state in trainer.optimizer.state.values():
+                            for k, v in state.items():
+                                if isinstance(v, torch.Tensor) and v.is_cuda:
+                                    state[k] = v.cpu()
+                        optimizer_offloaded = True
+                    except Exception as e:
+                        logger.warning(
+                            f"Optimizer offload to CPU failed at epoch {epoch}: "
+                            f"{type(e).__name__}: {e}. Leaving optimizer on current device."
+                        )
+
+                # 2. Move model to CPU to free all scattered GPU allocations
+                model_device = next(gen_model.parameters()).device
+                gen_model.cpu()
+
+                # 2b. Move conditioning masks to CPU so their allocations don't pin
+                # large expandable_segments, preventing empty_cache from freeing them.
+                gm = trainer._gen_metrics
+                _cond_tensors: list[tuple[str, torch.Tensor | None]] = []
+                for attr in ('fixed_conditioning_masks', 'fixed_gt_images',
+                             'fixed_size_bins', 'fixed_bin_maps'):
+                    t = getattr(gm, attr, None)
+                    if t is not None and t.is_cuda:
+                        _cond_tensors.append((attr, t))
+                        setattr(gm, attr, t.cpu())
+
+                # 3. Release ALL GPU memory (only CUDA Graph pools remain)
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
+
+                # 4. Move model back — allocates in fresh contiguous block
+                gen_model.to(model_device)
+                gen_model.eval()
+                # Move conditioning masks back to GPU
+                for attr, _ in _cond_tensors:
+                    t = getattr(gm, attr)
+                    setattr(gm, attr, t.to(model_device))
+
+                try:
+                    # Quick metrics every epoch
+                    gen_results = trainer._gen_metrics.compute_epoch_metrics(
+                        gen_model, trainer.strategy, trainer.mode
+                    )
+                    trainer._unified_metrics.log_generation(epoch, gen_results)
+
+                    # Extended metrics at figure_interval
+                    if (epoch + 1) % trainer.figure_interval == 0:
+                        extended_results = trainer._gen_metrics.compute_extended_metrics(
+                            gen_model, trainer.strategy, trainer.mode
+                        )
+                        trainer._unified_metrics.log_generation(epoch, extended_results)
+
+                    gen_model.train()
+                except torch.cuda.OutOfMemoryError as e:
+                    logger.warning(f"Generation metrics skipped due to OOM: {e}")
+                    torch.cuda.empty_cache()
+                except (RuntimeError, ValueError) as e:
+                    logger.exception(f"Generation metrics computation failed at epoch {epoch}: {e}")
+                finally:
+                    # Unload feature extractors to free VRAM for next training backward pass
+                    trainer._gen_metrics.unload_extractors()
+                    # Reload optimizer state back to GPU
+                    if optimizer_offloaded:
+                        try:
+                            for state in trainer.optimizer.state.values():
+                                for k, v in state.items():
+                                    if isinstance(v, torch.Tensor) and not v.is_cuda:
+                                        state[k] = v.to(trainer.device)
+                        except Exception as e:
+                            logger.error(
+                                f"Optimizer state restore to GPU failed at epoch {epoch}: "
+                                f"{type(e).__name__}: {e}. "
+                                f"Next optimizer step may crash — consider halting training."
+                            )
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+            # Record epoch history for JSON export (before reset)
+            trainer._unified_metrics.record_epoch_history(epoch)
+
+            # Reset validation metrics for next epoch
+            trainer._unified_metrics.reset_validation()
+
+        return metrics, worst_batch_data
+
+    finally:
+        # Ensure RNG state is ALWAYS restored, even if an exception occurred
+        torch.set_rng_state(rng_state)
+        if cuda_rng_state is not None:
+            torch.cuda.set_rng_state(cuda_rng_state, trainer.device)
+
+
+def compute_per_modality_validation(
+    trainer: 'DiffusionTrainer',
+    epoch: int,
+) -> None:
+    """Compute and log validation metrics for each modality separately.
+
+    For multi-modality training, this logs PSNR, LPIPS, MS-SSIM and regional
+    metrics for each modality (bravo, t1_pre, t1_gd) to compare with
+    single-modality experiments.
+
+    Args:
+        trainer: The DiffusionTrainer instance.
+        epoch: Current epoch number.
+    """
+    if not hasattr(trainer, 'per_modality_val_loaders') or not trainer.per_modality_val_loaders:
+        return
+
+    # Save random state (same pattern as compute_validation_losses)
+    rng_state = torch.get_rng_state()
+    cuda_rng_state = torch.cuda.get_rng_state(trainer.device) if torch.cuda.is_available() else None
+
+    model_to_use = trainer.ema.ema_model if trainer.ema is not None else trainer.model_raw
+    try:
+        model_to_use.eval()
+
+        for modality, loader in trainer.per_modality_val_loaders.items():
+            total_psnr = 0.0
+            total_lpips = 0.0
+            total_msssim = 0.0
+            n_batches = 0
+
+            # Initialize regional tracker for this modality
+            regional_tracker = None
+            if trainer.log_regional_losses:
+                regional_tracker = RegionalMetricsTracker(
+                    image_size=trainer.image_size,
+                    fov_mm=trainer._paths_config.fov_mm,
+                    loss_fn='mse',
+                    device=trainer.device,
+                )
+
+            with torch.no_grad():
+                for batch in loader:
+                    prepared = trainer.mode.prepare_batch(batch, trainer.device)
+                    images = prepared['images']
+                    labels = prepared.get('labels')
+                    size_bins = prepared.get('size_bins')
+                    bin_maps = prepared.get('bin_maps')
+
+                    # Keep pixel-space originals for quality metrics
+                    images_pixel = images
+
+                    # Encode to diffusion space (identity for PixelSpace)
+                    images = trainer.space.encode_batch(images)
+                    if labels is not None:
+                        labels = trainer.space.encode(labels)
+
+                    labels_dict = {'labels': labels, 'bin_maps': bin_maps}
+
+                    # Sample timesteps and noise
+                    noise = torch.randn_like(images).to(trainer.device)
+                    timesteps = trainer.strategy.sample_timesteps(images)
+                    noisy_images = trainer.strategy.add_noise(images, noise, timesteps)
+                    model_input = trainer.mode.format_model_input(noisy_images, labels_dict)
+
+                    # Predict
+                    if trainer.use_size_bin_embedding:
+                        prediction = model_to_use(model_input, timesteps, size_bins=size_bins)
+                    else:
+                        prediction = trainer.strategy.predict_noise_or_velocity(model_to_use, model_input, timesteps)
+                    _, predicted_clean = trainer.strategy.compute_loss(prediction, images, noise, noisy_images, timesteps)
+
+                    # Decode prediction to pixel space, compare against original pixels
+                    if trainer.space.needs_decode:
+                        metrics_pred = trainer.space.decode_batch(predicted_clean)
+                    else:
+                        metrics_pred = predicted_clean
+                    # Labels are only encoded in latent/wavelet spaces, not pixel normalization
+                    metrics_labels = trainer.space.decode(labels) if (labels is not None and trainer.space.encode_conditioning) else labels
+                    metrics_gt = images_pixel
+
+                    # Compute metrics in pixel space
+                    total_psnr += compute_psnr(metrics_pred, metrics_gt)
+                    if trainer.log_lpips:
+                        total_lpips += compute_perceptual_distance(metrics_pred, metrics_gt, device=trainer.device)
+                    total_msssim += compute_msssim(metrics_pred, metrics_gt)
+
+                    # Regional tracking (tumor vs background)
+                    if regional_tracker is not None and metrics_labels is not None:
+                        regional_tracker.update(metrics_pred, metrics_gt, metrics_labels)
+
+                    n_batches += 1
+
+            # Compute averages and log per-modality metrics (via unified metrics)
+            if n_batches > 0:
+                modality_metrics = {
+                    'psnr': total_psnr / n_batches,
+                    'msssim': total_msssim / n_batches,
+                }
+
+                if trainer.log_lpips:
+                    modality_metrics['lpips'] = total_lpips / n_batches
+
+                # Compute 3D MS-SSIM for this modality
+                if trainer.log_msssim:
+                    msssim_3d = trainer._compute_volume_3d_msssim(
+                        epoch, data_split='val', modality_override=modality
+                    )
+                    if msssim_3d is not None:
+                        modality_metrics['msssim_3d'] = msssim_3d
+
+                # Log via unified metrics
+                trainer._unified_metrics.log_per_modality_validation(modality_metrics, modality, epoch)
+
+                # Log regional metrics for this modality via unified system
+                if regional_tracker is not None:
+                    trainer._unified_metrics.log_validation_regional(
+                        regional_tracker, epoch, modality_override=modality
+                    )
+    finally:
+        model_to_use.train()
+
+        # Restore RNG state
+        torch.set_rng_state(rng_state)
+        if cuda_rng_state is not None:
+            torch.cuda.set_rng_state(cuda_rng_state, trainer.device)
